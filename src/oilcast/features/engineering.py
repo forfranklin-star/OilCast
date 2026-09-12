@@ -395,11 +395,15 @@ def institutional_bias(views: pd.DataFrame, index: pd.DatetimeIndex,
     if not source_available or views is None or views.empty:
         return pd.Series(np.nan if not source_available else 0.0, index=index, name="inst_bias")
     v = views.copy()
-    v["date"] = pd.to_datetime(v["date"])
+    v["date"] = pd.to_datetime(v["date"]).dt.normalize()
     v["score"] = v["stance"].map({"看涨": 1.0, "看跌": -1.0, "中性": 0.0}).fillna(0)
-    daily = v.set_index("date")["score"].sort_index()
-    roll = daily.rolling("30D").mean().reindex(index, method="ffill", limit=22)
-    return roll.clip(-1, 1).rename("inst_bias")
+    # 同一交易日可能有多条机构观点：先按日聚合为当日净看涨均值，保证索引唯一，
+    # 否则 rolling 后再 reindex 会抛 duplicate labels（CI 全新采集时复现过）。
+    daily = v.set_index("date")["score"].groupby(level=0).mean().sort_index()
+    idx_u = pd.DatetimeIndex(index)
+    roll = daily.rolling("30D").mean().reindex(idx_u.unique().sort_values(),
+                                               method="ffill", limit=22)
+    return roll.clip(-1, 1).reindex(idx_u).rename("inst_bias")
 
 
 def build_features(prices: pd.DataFrame, macro: pd.DataFrame,
@@ -415,6 +419,18 @@ def build_features(prices: pd.DataFrame, macro: pd.DataFrame,
     目标品种的交易日，确保目标在 t 日收盘时只看得到已经落定的外生行情（消除跨时区错配与
     隐性未来函数，例如上海原油不会用到同日北京时间次日凌晨才收盘的 WTI/Brent）；目标自身
     技术面仍按其自身连续交易日计算。"""
+    # 健壮性：多源合并/重复落库可能让价格或宏观出现重复交易日索引，而下游大量
+    # reindex/rolling 要求索引唯一，否则抛 "cannot reindex on an axis with duplicate labels"。
+    # 入口统一按交易日去重（重复日保留最后一条）并排序，保证后续全部对齐安全。
+    def _dedup_trading_index(df):
+        if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+            return df
+        d = df.copy()
+        d.index = pd.to_datetime(d.index)
+        d = d[~d.index.duplicated(keep="last")].sort_index()
+        return d
+    prices = _dedup_trading_index(prices)
+    macro = _dedup_trading_index(macro)
     # 交易时段对齐：prices/macro 在本函数作用域内替换为"目标视角下时点无泄漏"的面板
     if use_session_align:
         prices, macro = align_exogenous_to_target(prices, macro, target)
