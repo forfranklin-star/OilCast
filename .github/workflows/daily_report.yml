@@ -1,0 +1,88 @@
+name: daily-oil-report
+# =====================================================================
+# 每日 UTC 01:00 = 北京时间 09:00 自动运行（只用真实可追溯数据）：
+#   采集数据 → 质量门 → 特征工程 → 权重更新/模型训练 → 预测 → 生成报告
+#   1) 数据、模型工件(跨期热启动)与历史报告 commit 回仓库（触发 Streamlit Cloud 重部署）
+#   2) 最新静态 HTML 发布到 GitHub Pages（公开网页）
+# 自动运行保障：
+#   - cron 使用 UTC，"0 1 * * *" 即北京 09:00（GitHub 定时可能有数分钟~十几分钟延迟，属正常）；
+#   - schedule 只在【默认分支】生效，且仓库 Actions 未被禁用（fork 后需在 Actions 页启用）；
+#   - 每日 commit 会让仓库保持活跃，避免 GitHub 对 60 天无活动仓库自动停用定时任务；
+#   - 也可在 Actions 页选本工作流 → Run workflow 手动触发（workflow_dispatch）。
+# 数据原则：任何源不可达/过期/样本不足，对应模块标记 unavailable，绝不合成补齐。
+# =====================================================================
+on:
+  schedule:
+    - cron: "0 1 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build-report:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -e .
+      - name: Run daily pipeline (real-data only)
+        env:
+          # 可选 EIA key：仓库 Settings → Secrets and variables → Actions
+          EIA_API_KEY: ${{ secrets.EIA_API_KEY }}
+          TZ: Asia/Shanghai
+        run: |
+          date -u +"UTC now: %Y-%m-%d %H:%M (%Z)"
+          TZ=Asia/Shanghai date +"Beijing now: %Y-%m-%d %H:%M (%Z)"
+          python -m oilcast.pipeline.main
+      - name: Verify report artifact exists
+        run: |
+          test -f reports/latest/index.html && echo "latest/index.html OK"
+          test -f reports/latest/latest.json && echo "latest/latest.json OK"
+      - name: Smoke tests
+        run: pytest -q
+      - name: Commit data & reports back to repo
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # models/ 短期模型工件回传→次日热启动；data/ 内 SQLite 含因素权重EMA、
+          # 历史预测与报告日期索引→次日权重续学不退回先验。两者共同构成跨期持续学习闭环
+          git add data reports models
+          if git diff --cached --quiet; then
+            echo "今日无文件变更"
+          else
+            git commit -m "chore(daily): report $(date -u +%Y-%m-%d)"
+            git push
+          fi
+      - name: Setup Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          # 上传整个 reports：latest 页面通过 ../assets 共享本地 plotly bundle，
+          # 不依赖外网 CDN（国内网络也能即开即渲染）
+          path: reports
+
+  deploy-pages:
+    needs: build-report
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
