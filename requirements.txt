@@ -1,14 +1,18 @@
 # =====================================================================
-# 数值栈【钉上限】：整套已在 Python 3.12 + numpy 1.26 / pandas 2.2 / sklearn 1.4/1.5
-# 下完整测试通过。numpy 2.x 与 scikit-learn>=1.6 会在稀疏/全 NaN 特征列的分箱路径抛
-# "window shape cannot be larger than input array shape"（本地旧版无法复现、CI 装最新版
-# 才触发），故统一钉住大版本，保证 GitHub Actions 与本地验证环境严格一致、可重复构建。
-# 升级这些版本前，请先在干净虚拟环境跑通 `pytest -q` 全绿再放开上限。
+# 依赖区间说明
+# 代码已在两套版本矩阵下用同一套 39 项测试完整验证通过（含非加速的完整 walk-forward）：
+#   旧栈：numpy 1.26.4 / pandas 2.2.3 / scipy 1.13 / scikit-learn 1.4~1.5 / statsmodels 0.14
+#   新栈：numpy 2.5.x  / pandas 3.0.x / scipy 1.18 / scikit-learn 1.9    / statsmodels 0.15
+# 因此同时兼容 numpy 1.x/2.x 与新旧 sklearn/pandas，GitHub Actions(Python3.12) 与
+# Streamlit Cloud（默认 Python 可能是 3.12/3.13/3.14）都能解析到可安装的轮子，不会再出现
+# "numpy 1.26 无对应 Python 轮子→整份依赖安装中断→import yaml 等 ModuleNotFound"。
+# 上界只用于拦截未经测试的未来大版本（如 sklearn 2 / pandas 4）；升级大版本前先在干净
+# 虚拟环境跑通 `pytest -q` 全绿再放开。
 # =====================================================================
-# ---- 核心数据处理（钉版本，保证 CI=本地已验证环境）----
-numpy>=1.26,<2.0
-pandas>=2.1,<2.3
-scipy>=1.11,<1.14
+# ---- 核心数据处理 ----
+numpy>=1.26,<3.0
+pandas>=2.1,<4.0
+scipy>=1.11,<2.0
 PyYAML>=6.0
 requests>=2.31
 feedparser>=6.0.10
@@ -18,9 +22,9 @@ tqdm>=4.66
 xlrd>=2.0.1            # 读取 GPRD 地缘风险指数的 .xls 备份地址（主地址失效时启用）
 openpyxl>=3.1
 
-# ---- 建模（钉 sklearn<1.6、statsmodels 0.14.x，兼容 numpy 1.26）----
-scikit-learn>=1.3,<1.6
-statsmodels>=0.14,<0.15
+# ---- 建模（兼容 sklearn 1.3~1.9、statsmodels 0.14/0.15）----
+scikit-learn>=1.3,<2.0
+statsmodels>=0.14,<1.0
 # Prophet 与 XGBoost 为可选增强（体积较大，默认不安装也可运行全流程）：
 # prophet>=1.1.5
 # xgboost>=2.0
@@ -29,9 +33,9 @@ statsmodels>=0.14,<0.15
 yfinance>=0.2.40
 
 # ---- 可视化与交互报告 ----
-plotly>=5.18,<6
+plotly>=5.18,<7.0
 jinja2>=3.1
-streamlit>=1.32,<2
+streamlit>=1.32,<3.0
 
 # ---- 测试 ----
 pytest>=7.4
