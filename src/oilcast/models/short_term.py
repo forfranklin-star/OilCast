@@ -52,6 +52,23 @@ def neutralize_low_info(X: pd.DataFrame, min_non_null: int = MIN_FEATURE_NONNULL
 neutralize_all_nan = neutralize_low_info
 
 
+def _hgb_fit_columns(frame: pd.DataFrame) -> list:
+    """挑选可安全送入 HistGradientBoosting 分箱的数值列（基于【本次训练切片】）。
+
+    sklearn>=1.6（搭配 numpy2）的分箱器用 sliding_window_view(distinct_values, 2) 取相邻
+    均值作为阈值；当某列在该训练切片内"非缺失的不同取值不足 2 个"——整列全空，或非空但
+    只有一个唯一值（常数列）——窗口长度 2 大于输入长度，抛
+    "window shape cannot be larger than input array shape"（旧版 sklearn 会安全退化为
+    无阈值，故本地旧版不复现）。树模型对零方差列本就无法分裂、不含信息，因此逐次拟合前
+    剔除这些列；只影响当次拟合，不改动全局 feature_cols/schema，也不丢任何真实信息。"""
+    cols = []
+    for c in frame.columns:
+        s = frame[c]
+        if int(s.notna().sum()) >= 1 and int(s.dropna().nunique()) >= 2:
+            cols.append(c)
+    return cols
+
+
 @dataclass
 class PathResult:
     path: pd.DataFrame           # date, mean,q05,q25,q50,q75,q95
@@ -221,11 +238,18 @@ class ShortTermForecaster:
             yv, Xv = y[valid], X.loc[y[valid].index]
             if self.train_window > 0:
                 yv, Xv = yv.tail(self.train_window), Xv.tail(self.train_window)
+            # 逐 h 按"实际有标签的训练切片"剔除全空/常数列，规避新版 sklearn 分箱崩溃，
+            # 并把本次真正入模的列挂到模型上，供 predict 严格按同列对齐（旧工件回退 active）
+            fit_cols = _hgb_fit_columns(Xv)
+            if not fit_cols:
+                raise InsufficientData(
+                    f"h={h} 训练窗内无任何含≥2个不同真实值的特征列，拒绝训练")
             model = HistGradientBoostingRegressor(
                 max_depth=4, max_iter=iters, learning_rate=0.05,
                 min_samples_leaf=15, random_state=42)
-            model.fit(Xv, yv)
+            model.fit(Xv[fit_cols], yv)
             model._oilcast_cum_iter = iters
+            model._oilcast_fit_cols = list(fit_cols)
             self.models[h] = model
             self.cum_iters[h] = iters
             if h == self.horizon:
@@ -264,15 +288,19 @@ class ShortTermForecaster:
             tr_X, tr_log = X.iloc[lo:t], log_p.iloc[lo:t]
             # origin 时点的近期波动状态（只用 ≤t 信息，无泄漏）：用于把 β 按波动 regime 分层
             vol_t = float(tr_log.diff().iloc[-20:].std())
-            # 子窗内整列全空的列剔除（不填 0），预测行按同一组列对齐
-            keep = [c for c in tr_X.columns if int(tr_X[c].notna().sum()) >= 1]
-            tr_X = tr_X[keep]
             for h in hs:
                 y = (tr_log.shift(-h) - tr_log).dropna()
+                # 按"该 h 实际有标签的拟合切片"逐次剔除全空/常数列（不填 0）：既规避新版
+                # sklearn 对常数/全空列分箱抛 window shape，又保证 fit/predict 同列对齐
+                fit_frame = tr_X.loc[y.index]
+                keep = _hgb_fit_columns(fit_frame)
+                if not keep:
+                    # 该 origin 此步长窗内无任何含变化的真实特征，跳过，不污染 β/残差
+                    continue
                 m = HistGradientBoostingRegressor(
                     max_depth=4, max_iter=iters, learning_rate=0.05,
                     min_samples_leaf=15, random_state=42)
-                m.fit(tr_X.loc[y.index], y)
+                m.fit(fit_frame[keep], y)
                 pred = float(m.predict(X[keep].iloc[[t]])[0])
                 actual = float(log_p.iloc[t + h] - log_p.iloc[t])
                 # 长假日（如国内春节超过 3 个工作日短填充上限）会让个别 actual 为 NaN，
@@ -382,7 +410,7 @@ class ShortTermForecaster:
             if missing:
                 raise InsufficientData(f"预测输入缺少训练特征列：{missing}")
             latest_X = latest_X[active]
-        x_now = latest_X.iloc[[-1]]
+        x_base = latest_X.iloc[[-1]]
         rows = []
         for h, dt in enumerate(future_dates, start=1):
             # 点预测幅度由【样本外校准系数 β】决定（替代旧版拍脑袋的固定 0.7/0.9 收缩）：
@@ -393,6 +421,10 @@ class ShortTermForecaster:
                 else float(getattr(self, "point_shrink", 0.9))
             if not np.isfinite(beta):
                 beta = 0.0   # 校准系数异常时最保守处理：退守随机游走
+            # 与该步长模型实际入模列严格对齐（训练时剔除的窗内常数/全空列这里同样不取）；
+            # 旧版本导入的模型没有该标记时回退到 active 列集合
+            fit_cols = getattr(self.models[h], "_oilcast_fit_cols", None)
+            x_now = x_base[fit_cols] if fit_cols else x_base
             cum = beta * float(self.models[h].predict(x_now)[0])
             qs = self.resid_quantiles.get(h, self._fallback_quantiles(h))
             qs = np.asarray(qs, dtype=float)
