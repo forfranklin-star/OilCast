@@ -583,6 +583,20 @@ def test_backtest_multi_origin_and_fields():
     assert bt["window_start"] <= bt["window_end"]
 
 
+# ------------------------------------------------- 回测在含窗内常数列/稀疏列时不得静默归零
+def test_backtest_survives_constant_and_sparse_columns():
+    # 回归：训练端逐窗剔除"唯一值<2 的常数列"后，回测预测必须按模型实际入模列对齐，
+    # 否则特征数不匹配、每个原点都被 except 吞掉，页面显示"有效回测原点不足(0<10)"。
+    X, price = _toy_panel(n=700)
+    X["const_col"] = 1.0                       # 整列常数（新版 sklearn 分箱会崩、训练端剔除）
+    X["sparse_evt"] = np.nan
+    X.loc[X.index[-3:], "sparse_evt"] = [0.1, 0.2, 0.3]   # 极稀疏事件列
+    bt = backtest_short(X, price, horizon=10, n_origins=14, gap=4,
+                        calib_origins=4, calib_iter=20)
+    assert bt["available"] is True, f"含常数列时回测不应归零：{bt.get('reason')}"
+    assert bt["n_origins"] >= 10
+
+
 # ------------------------------------------------- 数据新鲜度守门：未取得新交易日必须显式告警
 def test_freshness_gate_flags_unchanged_lagging_fresh(monkeypatch):
     """新鲜度以"截至运行时刻最近应已收盘交易日"为基准：凌晨/周末运行不误报，真缺数才告警。"""

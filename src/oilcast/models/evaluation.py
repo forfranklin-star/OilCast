@@ -33,6 +33,8 @@ def backtest_short(features: pd.DataFrame, price: pd.Series,
     errs, bench_errs, raw_errs = [], [], []
     pred_ret, actual_ret, raw_ret = [], [], []
     hits, raw_hits, evaluated = 0, 0, 0
+    fit_failures = 0
+    last_err = None
     for t in origins:
         tr_X, tr_p = features.iloc[:t], price.iloc[:t]
         try:
@@ -42,12 +44,19 @@ def backtest_short(features: pd.DataFrame, price: pd.Series,
                                      calib_origins=calib_origins,
                                      calib_iter=calib_iter,
                                      run_arima=False).fit(tr_X, tr_p)
-            active = getattr(fc, "active_cols", None)
-            x_now = (tr_X[active] if active is not None else tr_X).iloc[[-1]]
-            raw = float(fc.models[horizon].predict(x_now)[0])
+            # 必须按该步长模型【实际入模列】对齐：训练时会逐窗剔除唯一值<2 的常数列
+            # （规避新版 sklearn 分箱崩溃），其列名挂在模型上；旧工件回退到 active_cols。
+            step_model = fc.models[horizon]
+            fit_cols = getattr(step_model, "_oilcast_fit_cols", None)
+            if fit_cols is None:
+                fit_cols = getattr(fc, "active_cols", None)
+            x_now = (tr_X[fit_cols] if fit_cols is not None else tr_X).iloc[[-1]]
+            raw = float(step_model.predict(x_now)[0])
             beta = float(fc.calib_beta.get(horizon, getattr(fc, "point_shrink", 0.9)))
             cum_pred = beta * raw
-        except Exception:
+        except Exception as exc:  # 单个原点失败不拖垮整体，但计数并保留原因，杜绝静默归零
+            fit_failures += 1
+            last_err = repr(exc)
             continue
         p_now, p_fut = price.iloc[t], price.iloc[t + horizon]
         if pd.isna(p_now) or pd.isna(p_fut):
@@ -65,7 +74,11 @@ def backtest_short(features: pd.DataFrame, price: pd.Series,
             raw_hits += 1
         evaluated += 1
     if evaluated < 10:
-        return {"available": False, "reason": f"有效回测原点不足({evaluated}<10)"}
+        diag = f"；{fit_failures} 个原点拟合/预测失败" if fit_failures else ""
+        if fit_failures and last_err:
+            diag += f"，末例错误：{last_err[:160]}"
+        return {"available": False,
+                "reason": f"有效回测原点不足({evaluated}<10){diag}"}
     mae = float(np.mean(errs))
     bench_mae = float(np.mean(bench_errs))
     raw_mae = float(np.mean(raw_errs))
