@@ -64,13 +64,20 @@ def review_predictions(prices: Dict[str, pd.Series], as_of: pd.Timestamp,
             dir_hit = bool(np.sign(pred_ret) == np.sign(actual_ret))
         else:
             dir_hit = None   # 明确中性：不计方向对错
+        # 经济价值：明确表态按立场取号后的实际收益（看涨+实际、看跌-实际），中性不持仓置 None
+        if stance == "看涨":
+            strat_ret = actual_ret * 100
+        elif stance == "看跌":
+            strat_ret = -actual_ret * 100
+        else:
+            strat_ret = None
         rows.append({
             "report_date": r["report_date"], "target_date": target.strftime("%Y-%m-%d"),
             "horizon": r["horizon"], "instrument": inst,
             "base": round(p0, 2), "pred": round(float(mean), 2), "actual": round(actual, 2),
             "pred_ret_pct": round(pred_ret * 100, 2), "actual_ret_pct": round(actual_ret * 100, 2),
             "abs_err_pct": round(abs(float(mean) - actual) / actual * 100, 2),
-            "stance": stance, "dir_hit": dir_hit,
+            "stance": stance, "dir_hit": dir_hit, "strat_ret_pct": strat_ret,
             "is_neutral": bool(stance == "中性"),
             "covered": covered,
         })
@@ -81,6 +88,11 @@ def review_predictions(prices: Dict[str, pd.Series], as_of: pd.Timestamp,
         cov = g["covered"].dropna().astype(float)
         dh = g["dir_hit"].dropna().astype(float)   # 只含明确表态（中性已置 None）
         n_neutral = int(g["is_neutral"].sum())
+        # 表态子集经济价值：按立场取号后的实际平均收益与盈亏比（胜率之外的盈利能力口径）
+        sr = g["strat_ret_pct"].dropna().astype(float) if "strat_ret_pct" in g else pd.Series(dtype=float)
+        wins, losses = sr[sr > 0], sr[sr < 0]
+        payoff = (float(wins.mean() / abs(losses.mean()))
+                  if len(wins) and len(losses) else None)
         return {
             "n": int(len(g)),
             "engaged_n": int(len(dh)),
@@ -88,6 +100,8 @@ def review_predictions(prices: Dict[str, pd.Series], as_of: pd.Timestamp,
             "mae_pct": round(float(g["abs_err_pct"].mean()), 2),
             "dir_acc": round(float(dh.mean()) * 100, 1) if len(dh) else None,
             "coverage95": round(float(cov.mean()) * 100, 1) if len(cov) else None,
+            "engaged_mean_ret_pct": round(float(sr.mean()), 2) if len(sr) else None,
+            "engaged_payoff": round(payoff, 2) if payoff is not None else None,
         }
     by_horizon: Dict[str, dict] = {hz: _summ(g) for hz, g in d.groupby("horizon")}
     summary = {**_summ(d), "by_horizon": by_horizon}

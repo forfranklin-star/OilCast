@@ -840,6 +840,27 @@ def test_backtest_three_class_metrics():
     assert bt["stance_engaged_n"] == round(bt["stance_engagement_rate"] * bt["n_origins"])
 
 
+def test_trend_gate_rewards_payoff_not_just_winrate():
+    # 趋势通道经济价值判据：胜率不足 55% 但盈亏比>1、期望显著为正也应放行
+    tg = ShortTermForecaster._trend_gate
+    good = [(1.0, 0.03)] * 9 + [(1.0, -0.01)] * 11   # 胜率45%、盈亏比3、期望为正
+    g = tg(good, 0.05, min_eng=8, min_payoff=1.15, max_ret_p=0.10)
+    assert g["has_edge"] is True and g["payoff"] >= 1.15 and g["mean_ret"] > 0
+    assert g["hit"] < 0.55
+    bad = [(1.0, 0.01)] * 11 + [(1.0, -0.03)] * 9    # 赢小亏大、期望为负，不放行
+    assert tg(bad, 0.05, 8, 1.15, 0.10)["has_edge"] is False
+    assert tg([(1.0, 0.02)] * 4, 0.05, 8, 1.15, 0.10)["has_edge"] is False
+
+
+def test_backtest_reports_economic_value():
+    X, price = _direction_panel(predictable=True, n=1200)
+    bt = backtest_short(X, price, horizon=5, n_origins=12, gap=3,
+                        calib_origins=4, calib_iter=20, dir_origins=40)
+    for k in ("stance_engaged_mean_ret_pct", "stance_engaged_payoff",
+              "stance_engaged_sharpe", "buyhold_mean_ret_pct"):
+        assert k in bt
+
+
 def test_direction_layer_persists_across_pickle(tmp_path):
     # 方向分类器/校准器/门控证据随工件整体持久化，导入后仍能给三分类立场（不从零）
     import joblib

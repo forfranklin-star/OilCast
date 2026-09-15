@@ -60,7 +60,15 @@ def forecast_narrative(ep: dict, name: str, unit: str, horizon_cn: str) -> str:
     p_up = float(ep.get("dir_prob_up", ep.get("prob_up", 0.5)))
     iv = (f"50%概率区间 [{ep['q25']}, {ep['q75']}]，95%概率区间 [{ep['q05']}, {ep['q95']}]")
     edge_txt = ""
-    if ep.get("dir_has_edge") and ep.get("dir_edge_hit") is not None:
+    basis = ep.get("dir_edge_basis")
+    if basis == "趋势期望":
+        payoff = ep.get("dir_edge_payoff")
+        mret = ep.get("dir_edge_mean_ret")
+        edge_txt = ("该周期由近 1 月时序动量的【趋势跟随】通道触发（历史样本外顺势表态"
+                    + (f"平均收益 {mret:+.2f}%、" if mret is not None else "")
+                    + (f"盈亏比 {payoff}" if payoff is not None else "")
+                    + "，胜率可不占优、靠盈亏比取得正期望，属低胜率高赔率信号）；")
+    elif ep.get("dir_has_edge") and ep.get("dir_edge_hit") is not None:
         edge_txt = (f"该周期历史样本外高置信表态命中率约 {ep['dir_edge_hit']*100:.0f}%"
                     + (f"（二项检验 p={ep['dir_edge_p']}）" if ep.get("dir_edge_p") is not None else "")
                     + "，方向信号通过显著性门控；")
@@ -263,12 +271,22 @@ def backtest_narrative(bt: dict) -> Optional[str]:
         dir_txt = (f"方向采用看涨/看跌/中性三分类：明确表态占比 {er*100:.0f}%、"
                    f"{bt.get('stance_neutral_rate', 0)*100:.0f}% 判中性，表态原点方向命中 "
                    f"{acc*100:.0f}%{p_txt}（{gate}），概率 Brier {bt.get('direction_brier', '-')}；")
+    # 经济价值口径：胜率≠盈利能力，趋势信号可在胜率不高时靠盈亏比取得正期望
+    econ_txt = ""
+    mr, po, sh = (bt.get("stance_engaged_mean_ret_pct"), bt.get("stance_engaged_payoff"),
+                  bt.get("stance_engaged_sharpe"))
+    if er and er > 0 and mr is not None:
+        econ_txt = (f"表态原点按立场持有 {bt['horizon_td']} 日的平均收益 {mr:+.2f}%、"
+                    f"盈亏比 {po if po is not None else '-'}、近似年化夏普 {sh if sh is not None else '-'}，"
+                    f"同期无条件持有的平均收益 {bt.get('buyhold_mean_ret_pct', '-')}%（胜率与"
+                    f"盈利能力分开考核）；")
     return (f"近期滚动回测（{span}{bt['n_origins']} 个样本外原点、{bt['horizon_td']} 交易日视野，"
             f"每个原点均只用当时可得数据、按滚动训练窗拟合，门控只用回测起点之前数据，全程无未来"
-            f"泄漏）：幅度 MAE {bt['mae_pct']}%，{dir_txt}预测与实际累计收益相关系数 "
+            f"泄漏）：幅度 MAE {bt['mae_pct']}%，{dir_txt}{econ_txt}预测与实际累计收益相关系数 "
             f"{bt.get('ic', 0):.2f}；随机游走基准误差 {bt['benchmark_mae_pct']}%，"
-            f"本模型{cmp_word}{imp_txt}。全球定价的原油日度方向信噪比天然偏低、长期围绕 50% "
-            f"波动属正常，系统只在样本外显著时才明确表态，不以过拟合或未来函数制造虚高命中。")
+            f"本模型{cmp_word}{imp_txt}。全球定价的原油日度方向信噪比天然偏低、胜率长期围绕 50% "
+            f"波动属正常，故系统同时考核胜率与经济价值，只在样本外显著（胜率或期望收益）时才明确"
+            f"表态，不以过拟合或未来函数制造虚高命中。")
 
 
 def lineage_narrative(bundle) -> str:

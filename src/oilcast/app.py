@@ -179,7 +179,10 @@ for col, hz in zip(cols, ("short", "mid", "long")):
         st.metric(f"预测均值（{_sel_unit}）", f"{ep['mean']:.2f}", delta=f"{ep['pct_mean']:+.2f}%")
         stance = ep.get("dir_stance", "中性")
         edge_note = ""
-        if ep.get("dir_has_edge") and ep.get("dir_edge_hit") is not None:
+        if ep.get("dir_edge_basis") == "趋势期望":
+            edge_note = (f"｜趋势跟随（低胜率高盈亏比）：样本外顺势均收 "
+                         f"{ep.get('dir_edge_mean_ret', '—')}%、盈亏比 {ep.get('dir_edge_payoff', '—')}")
+        elif ep.get("dir_has_edge") and ep.get("dir_edge_hit") is not None:
             edge_note = f"｜样本外表态命中 {ep['dir_edge_hit']*100:.0f}%"
         elif stance == "中性":
             edge_note = "｜方向未达显著门控，以区间为准"
@@ -310,16 +313,28 @@ if ml:
             b3.metric("表态时方向命中",
                       (f"{eng*100:.0f}%" if eng is not None else "—"),
                       f"p={bt.get('stance_engaged_p', '—')}")
+            basis = bt.get("gate_edge_basis")
             b4.metric("明确表态占比", f"{bt.get('stance_engagement_rate', 0)*100:.0f}%",
                       f"中性 {bt.get('stance_neutral_rate', 0)*100:.0f}%｜{gate}")
             b5.metric("概率Brier", f"{bt.get('direction_brier', '—')}")
+            # 经济价值行：胜率≠盈利能力，单独考核表态子集的期望收益/盈亏比/夏普
+            e1, e2, e3 = st.columns(3)
+            e1.metric("表态平均收益",
+                      (f"{bt['stance_engaged_mean_ret_pct']:+.2f}%"
+                       if bt.get("stance_engaged_mean_ret_pct") is not None else "—"),
+                      "按立场持有该周期")
+            e2.metric("表态盈亏比", f"{bt.get('stance_engaged_payoff', '—')}",
+                      "平均盈利/平均亏损")
+            e3.metric("表态近似年化夏普", f"{bt.get('stance_engaged_sharpe', '—')}",
+                      f"无条件持有均收 {bt.get('buyhold_mean_ret_pct', '—')}%")
             st.caption(
                 f"{bt.get('window_start','')}~{bt.get('window_end','')} 共 {bt['n_origins']} 个样本外原点；"
-                "方向为看涨/看跌/中性三分类，中性是弱有效市场下的诚实选择、不计为错误，"
-                "仅当样本外表态命中显著高于 50%（门控通过）才明确表态；"
+                "方向为看涨/看跌/中性三分类，中性是弱有效市场下的诚实选择、不计为错误；"
+                + (f"本期方向 edge 来源：{basis}；" if basis else "")
+                + "门控按【胜率显著高于50%】或【趋势跟随期望收益为正、盈亏比>1】任一判据放行；"
                 + (f"幅度 MAE 较随机游走降低 {bt.get('mae_improve_pct', 0)}%。"
                    if bt["mae_pct"] < bt["benchmark_mae_pct"]
-                   else "幅度预测在随机游走基准附近，价值主要体现在区间刻画；日频方向围绕 50% 属正常。"))
+                   else "幅度预测在随机游走基准附近，价值主要体现在区间刻画；日频胜率围绕 50% 属正常，需结合盈亏比判断盈利能力。"))
         else:
             st.caption(bt.get("reason", "真实样本积累中，回测暂不可用"))
     with c2:
@@ -327,12 +342,19 @@ if ml:
         rv = ml.get("review", {})
         if rv.get("available"):
             sm = rv["summary"]
-            r1, r2, r3 = st.columns(3)
-            r1.metric("已到期预测", f"{sm['n']} 条")
+            r1, r2, r3, r4 = st.columns(4)
+            r1.metric("已到期预测", f"{sm['n']} 条",
+                      f"明确表态 {sm.get('engaged_n', 0)}、中性 {sm.get('neutral_n', 0)}")
             r2.metric("平均误差", f"{sm['mae_pct']}%")
-            r3.metric("方向命中", f"{sm['dir_acc']}%" if sm["dir_acc"] is not None else "—")
-            st.caption(f"95%区间覆盖真实价比例：{sm['coverage95']}%"
-                       if sm["coverage95"] is not None else "区间覆盖统计积累中")
+            r3.metric("表态方向命中", f"{sm['dir_acc']}%" if sm["dir_acc"] is not None else "—")
+            r4.metric("表态平均收益/盈亏比",
+                      (f"{sm['engaged_mean_ret_pct']:+.2f}%"
+                       if sm.get("engaged_mean_ret_pct") is not None else "—"),
+                      f"盈亏比 {sm.get('engaged_payoff', '—')}")
+            cap = (f"95%区间覆盖真实价比例：{sm['coverage95']}%"
+                   if sm["coverage95"] is not None else "区间覆盖统计积累中")
+            cap += "；中性预测不参与方向命中，胜率与盈亏比分开考核"
+            st.caption(cap)
         else:
             st.caption(rv.get("reason", "历史预测目标日尚未到期，下一期起复测"))
     wd = pd.DataFrame(ml.get("weight_delta", []))

@@ -13,7 +13,7 @@ from typing import Dict, Optional
 
 import numpy as np
 import pandas as pd
-from scipy.stats import norm, binomtest
+from scipy.stats import norm, binomtest, ttest_1samp
 from sklearn.ensemble import (
     HistGradientBoostingRegressor, HistGradientBoostingClassifier)
 from sklearn.isotonic import IsotonicRegression
@@ -111,6 +111,9 @@ class ShortTermForecaster:
         self.dir_models: Dict[int, HistGradientBoostingClassifier] = {}
         self.dir_calib: Dict[int, Optional[IsotonicRegression]] = {}
         self.dir_edge: Dict[int, dict] = {}
+        # trend_edge: 独立时序动量通道（mom_21）的样本外经济价值证据。与 ML 概率通道并行：
+        # 趋势跟随常胜率不高但盈亏比>1、期望为正，单独按经济价值判据门控。随工件持久化。
+        self.trend_edge: Dict[int, dict] = {}
 
     # ------------------------------------------------------------- fit
     def fit(self, X: pd.DataFrame, price: pd.Series,
@@ -412,6 +415,7 @@ class ShortTermForecaster:
         if self.dir_origins_override == 0:
             self.dir_calib = getattr(self, "dir_calib", None) or {}
             self.dir_edge = getattr(self, "dir_edge", None) or {}
+            self.trend_edge = getattr(self, "trend_edge", None) or {}
             self._train_direction(X, log_p)
             return
         # 门控回看长度（交易日）。方向 edge 是稳定统计性质，短窗（如近 300 日）噪声大、
@@ -419,7 +423,10 @@ class ShortTermForecaster:
         # 显著性不被高估），结论才与长样本无泄漏回测一致。dir_origins_override>0 时按
         # "回看 origin*h 个交易日"近似，供回测/测试压缩规模。
         win = self.train_window
-        iters = int(mcfg.get("dir_clf_max_iter", 200))
+        # 门控滚动要在数百个非重叠原点上反复拟合，只用于判定 edge 是否存在，用较少迭代即可，
+        # 避免每日任务过慢；最终部署用方向分类器在 _train_direction 内用满 dir_clf_max_iter。
+        iters = int(mcfg.get("dir_gate_max_iter",
+                             min(60, int(mcfg.get("dir_clf_max_iter", 120)))))
         if self.dir_origins_override:
             lookback = self.dir_origins_override * max(hs)
         else:
@@ -427,10 +434,20 @@ class ShortTermForecaster:
         n = len(X)
         last = n - 1
         dir_pa: Dict[int, list] = {h: [] for h in hs}
+        trend_pa: Dict[int, list] = {h: [] for h in hs}
+        # 时序动量通道：mom_21 及"截至 t 的扩展中位数"作趋势强度下限（只用 ≤t 数据，无泄漏）
+        mom21 = X["mom_21"] if "mom_21" in X.columns else pd.Series(np.nan, index=X.index)
+        mom21_cut = mom21.abs().expanding(min_periods=60).median()
         for h in hs:
             first = max(win + 2, last - lookback)
             origins = list(range(first, last - h + 1, h))   # 间隔=h，标签非重叠
             for t in origins:
+                # 趋势通道：mom_21 强度越过其历史中位数才记录"顺势持有 h"的实际对数收益
+                m21 = float(mom21.iloc[t]); cut = mom21_cut.iloc[t]
+                fwd_ret = float(log_p.iloc[t + h] - log_p.iloc[t])
+                if (np.isfinite(m21) and np.isfinite(cut) and np.isfinite(fwd_ret)
+                        and abs(m21) >= cut):
+                    trend_pa[h].append((np.sign(m21), fwd_ret))
                 lo = max(0, t - win + 1)
                 tr_X = X.iloc[lo:t + 1]
                 tr_log = log_p.iloc[lo:t + 1]
@@ -452,11 +469,13 @@ class ShortTermForecaster:
                     clf.fit(Xf[keep], yd)
                     p_up = float(clf.predict_proba(X[keep].iloc[[t]])[0, 1])
                     actual_dir = int(log_p.iloc[t + h] > log_p.iloc[t])
-                    if np.isfinite(p_up):
-                        dir_pa[h].append((p_up, actual_dir))
+                    # 同时记录该原点 t→t+h 的实际对数收益，供"经济价值判据"评估期望/盈亏比
+                    if np.isfinite(p_up) and np.isfinite(fwd_ret):
+                        dir_pa[h].append((p_up, actual_dir, fwd_ret))
                 except Exception:
                     continue
-        self._fit_direction_gate(hs, dir_pa, mcfg)
+        cur_cut = float(mom21_cut.iloc[last]) if np.isfinite(mom21_cut.iloc[last]) else np.nan
+        self._fit_direction_gate(hs, dir_pa, mcfg, trend_pa, cur_cut)
         self._train_direction(X, log_p)
 
     @staticmethod
@@ -477,36 +496,80 @@ class ShortTermForecaster:
                 cal[fold] = rp[fold]   # 训练折信息不足时回退原始概率，不强行校准
         return cal
 
-    def _fit_direction_gate(self, hs, dir_pa, mcfg) -> None:
-        """用滚动原点【样本外】涨跌概率做 isotonic 概率校准，并检验该步长方向 edge 是否
-        统计成立。只有"高置信表态命中率显著高于 50%"时 has_edge=True，方向才允许明确表态；
-        否则方向判中性（弱有效市场下诚实不表态），避免被 β 压平后又把中性计成方向错误。"""
+    @staticmethod
+    def _trend_gate(tarr, strength_cut, min_eng, min_payoff, max_ret_p) -> dict:
+        """独立时序动量通道的样本外经济价值检验。tarr 元素=(mom_21 符号, 顺势持有 h 的
+        实际对数收益)。胜率可不足 55%，只要平均收益>0、盈亏比达标、t 检验显著即认可。"""
+        out = {"has_edge": False, "n": len(tarr), "hit": None, "mean_ret": None,
+               "payoff": None, "p": None,
+               "strength_cut": (round(float(strength_cut), 5)
+                                if np.isfinite(strength_cut) else None)}
+        if len(tarr) < min_eng:
+            return out
+        sgn = np.array([a[0] for a in tarr], dtype=float)
+        ret = np.array([a[1] for a in tarr], dtype=float)
+        strat = sgn * ret
+        hit = float((np.sign(ret) == sgn).mean())
+        mean = float(strat.mean())
+        wins, losses = strat[strat > 0], strat[strat < 0]
+        payoff = (float(wins.mean() / abs(losses.mean()))
+                  if len(wins) and len(losses) else np.nan)
+        p = float(ttest_1samp(strat, 0.0).pvalue) if len(tarr) >= 3 else 1.0
+        ok = bool(mean > 0 and np.isfinite(payoff) and payoff >= min_payoff
+                  and p <= max_ret_p)
+        out.update(has_edge=ok, hit=round(hit, 3), mean_ret=round(mean * 100, 3),
+                   payoff=round(payoff, 3) if np.isfinite(payoff) else None,
+                   p=round(p, 3))
+        return out
+
+    def _fit_direction_gate(self, hs, dir_pa, mcfg, trend_pa=None,
+                            trend_cut: float = np.nan) -> None:
+        """方向 edge 由两条【独立通道】检验，任一成立才允许明确表态：
+
+        通道A·ML 概率：样本外 isotonic（交叉拟合）校准后，高置信表态的【胜率】显著>50%。
+        通道B·时序动量(mom_21)：不依赖 ML 概率，趋势强度越过历史中位数时顺势持有 h，按
+          【经济价值】判据——平均收益>0、盈亏比≥阈值、t 检验显著。趋势跟随常胜率不高
+          （可低于 55%）但盈亏比>1、期望为正，单看胜率会误杀，故单列。
+        edge_basis 记录成立来源（"胜率"/"趋势期望"）；都不成立则诚实中性。全部数字来自
+        严格样本外、非重叠原点，绝不用原点自身校准后再评它。"""
         thr = float(mcfg.get("dir_conf_threshold", 0.62))
         margin = thr - 0.5
         min_n = int(mcfg.get("edge_min_n", 20))
         min_eng = int(mcfg.get("edge_min_engaged", 8))
         min_hit = float(mcfg.get("edge_min_hit", 0.55))
         max_p = float(mcfg.get("edge_max_p", 0.20))
-        self.dir_calib, self.dir_edge = {}, {}
+        min_payoff = float(mcfg.get("edge_min_payoff", 1.15))
+        max_ret_p = float(mcfg.get("edge_max_ret_p", 0.10))
+        trend_pa = trend_pa or {}
+        self.dir_calib, self.dir_edge, self.trend_edge = {}, {}, {}
         for h in hs:
+            te = self._trend_gate(trend_pa.get(h, []), trend_cut,
+                                  min_eng, min_payoff, max_ret_p)
+            self.trend_edge[h] = te
             arr = dir_pa.get(h, [])
             base = dict(conf_threshold=thr, n=len(arr))
+            trend_fields = {"trend_n": te["n"], "trend_hit": te["hit"],
+                            "trend_mean_ret": te["mean_ret"], "trend_payoff": te["payoff"],
+                            "trend_p": te["p"]}
+            empty = {**base, "has_edge": te["has_edge"],
+                     "edge_basis": "趋势期望" if te["has_edge"] else None,
+                     "engaged_n": 0, "engaged_hit": None, "engaged_p": None,
+                     "all_hit": None, "engaged_mean_ret": None, "engaged_payoff": None,
+                     "engaged_ret_p": None, **trend_fields}
             if len(arr) < min_n:
                 self.dir_calib[h] = None
-                self.dir_edge[h] = {**base, "has_edge": False, "engaged_n": 0,
-                                    "engaged_hit": None, "engaged_p": None,
-                                    "all_hit": None, "reason": "样本外原点不足"}
+                self.dir_edge[h] = {**empty, "reason": "样本外原点不足"}
                 continue
             rp = np.array([a[0] for a in arr], dtype=float)
             ad = np.array([a[1] for a in arr], dtype=int)
+            fr = np.array([a[2] for a in arr], dtype=float)
             # 部署用校准器：用全部样本外点拟合（预测的是未来新点，无泄漏）
             iso = None
             if len(np.unique(rp)) >= 2 and len(np.unique(ad)) == 2:
                 iso = IsotonicRegression(out_of_bounds="clip", y_min=0.02,
                                          y_max=0.98).fit(rp, ad)
-            # edge 评估必须用【交叉拟合 out-of-fold】校准概率：评估某原点时校准器由其余
-            # 原点拟合，绝不用该原点自身的实际方向校准后再评它，否则 isotonic 记忆样本、
-            # 系统性虚高"高置信命中"（样本内校准泄漏，曾让无 edge 的 WTI 假性达标）。
+            # edge 评估必须用【交叉拟合 out-of-fold】校准概率（理由见方法注释），
+            # 否则 isotonic 记忆样本会系统性虚高高置信命中（样本内校准泄漏）。
             cal = self._crossfit_calibrated_prob(rp, ad)
             engaged = np.abs(cal - 0.5) >= margin
             en = int(engaged.sum())
@@ -514,12 +577,31 @@ class ShortTermForecaster:
             all_hit = float(((cal >= 0.5) == (ad == 1)).mean())
             hit = eh / en if en else 0.5
             p_val = float(binomtest(eh, en, 0.5).pvalue) if en else 1.0
-            has_edge = bool(len(arr) >= min_n and en >= min_eng
-                            and hit >= min_hit and p_val <= max_p)
+            # —— 通道A 经济价值：ML 高置信表态子集按方向的对数收益 ——
+            strat = np.sign(cal[engaged] - 0.5) * fr[engaged] if en else np.array([])
+            wins = strat[strat > 0]; losses = strat[strat < 0]
+            mean_ret = float(strat.mean()) if en else 0.0
+            payoff = (float(wins.mean() / abs(losses.mean()))
+                      if len(wins) and len(losses) else np.nan)
+            ret_p = float(ttest_1samp(strat, 0.0).pvalue) if en >= 3 else 1.0
+            hit_edge = bool(en >= min_eng and hit >= min_hit and p_val <= max_p)
+            econ_edge = bool(en >= min_eng and mean_ret > 0 and np.isfinite(payoff)
+                             and payoff >= min_payoff and ret_p <= max_ret_p)
+            has_edge = hit_edge or econ_edge or te["has_edge"]
+            if hit_edge:
+                edge_basis = "胜率"
+            elif econ_edge or te["has_edge"]:
+                edge_basis = "趋势期望"
+            else:
+                edge_basis = None
             self.dir_calib[h] = iso
-            self.dir_edge[h] = {**base, "has_edge": has_edge, "engaged_n": en,
-                                "engaged_hit": round(hit, 3), "engaged_p": round(p_val, 3),
-                                "all_hit": round(all_hit, 3)}
+            self.dir_edge[h] = {
+                **base, "has_edge": has_edge, "edge_basis": edge_basis,
+                "engaged_n": en, "engaged_hit": round(hit, 3),
+                "engaged_p": round(p_val, 3), "all_hit": round(all_hit, 3),
+                "engaged_mean_ret": round(mean_ret * 100, 3),
+                "engaged_payoff": round(float(payoff), 3) if np.isfinite(payoff) else None,
+                "engaged_ret_p": round(ret_p, 3), **trend_fields}
 
     def _train_direction(self, X: pd.DataFrame, log_p: pd.Series) -> None:
         """对每个 anchor 步长用最近滚动窗训练最终涨跌分类器。严格无泄漏：标签
@@ -571,12 +653,24 @@ class ShortTermForecaster:
         edge = dict(self.dir_edge.get(ha, {})); edge["anchor"] = ha
         thr = float(edge.get("conf_threshold", 0.62))
         has = bool(edge.get("has_edge", False))
+        stance = "中性"
+        # 通道A：ML 概率（胜率/ML 经济价值）edge 成立且校准概率越过置信带才表态
         if has and p >= thr:
             stance = "看涨"
         elif has and p <= 1 - thr:
             stance = "看跌"
         else:
-            stance = "中性"
+            # 通道B：独立时序动量趋势补位——ML 概率中性，但 mom_21 趋势的样本外经济价值
+            # 成立、且当前趋势强度越过门控期强度下限时，按趋势方向表态（低胜率高盈亏比型）。
+            te = self.trend_edge.get(ha, {})
+            if te.get("has_edge") and "mom_21" in x_row.columns:
+                m_now = float(x_row["mom_21"].iloc[0])
+                cut = te.get("strength_cut")
+                if np.isfinite(m_now) and cut is not None and abs(m_now) >= cut:
+                    stance = "看涨" if m_now > 0 else "看跌"
+                    edge = {**edge, "edge_basis": "趋势期望", "trend_hit": te.get("hit"),
+                            "trend_mean_ret": te.get("mean_ret"),
+                            "trend_payoff": te.get("payoff"), "trend_p": te.get("p")}
         return p, stance, edge
 
     def _arima_benchmark(self, log_p: pd.Series) -> None:
@@ -669,9 +763,12 @@ class ShortTermForecaster:
             "dir_prob_up": round(dir_prob, 3),
             "dir_stance": stance,
             "dir_has_edge": bool(edge.get("has_edge", False)),
+            "dir_edge_basis": edge.get("edge_basis"),
             "dir_edge_hit": edge.get("engaged_hit"),
             "dir_edge_p": edge.get("engaged_p"),
             "dir_edge_n": edge.get("n"),
+            "dir_edge_mean_ret": edge.get("engaged_mean_ret"),
+            "dir_edge_payoff": edge.get("engaged_payoff"),
         }
         bench = None
         if getattr(self, "arima_cumret", None) is not None:

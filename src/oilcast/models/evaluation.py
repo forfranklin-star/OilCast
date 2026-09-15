@@ -13,9 +13,31 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-from scipy.stats import binomtest
+from scipy.stats import binomtest, ttest_1samp
 
 from .short_term import ShortTermForecaster
+
+
+def _econ_summary(rs, horizon: int) -> dict:
+    """一组【按立场取号后的持有期对数收益】的经济价值统计。
+
+    mean 平均对数收益(%)、payoff 盈亏比(平均盈利/平均亏损)、p 单样本 t 检验(相对0)、
+    sharpe 年化近似夏普(按 252/horizon 折算)、cum 累计对数收益(%)。样本不足给 None。"""
+    rs = np.asarray(rs, dtype=float)
+    n = int(len(rs))
+    if n < 3:
+        return {"n": n, "mean_pct": None, "payoff": None, "p": None,
+                "sharpe": None, "cum_pct": None}
+    wins, losses = rs[rs > 0], rs[rs < 0]
+    payoff = (float(wins.mean() / abs(losses.mean()))
+              if len(wins) and len(losses) else np.nan)
+    p = float(ttest_1samp(rs, 0.0).pvalue)
+    std = float(rs.std(ddof=1)) if n >= 2 else 0.0
+    sharpe = float(rs.mean() / std * np.sqrt(252.0 / horizon)) if std > 0 else 0.0
+    return {"n": n, "mean_pct": round(float(rs.mean()) * 100, 3),
+            "payoff": round(payoff, 3) if np.isfinite(payoff) else None,
+            "p": round(p, 3), "sharpe": round(sharpe, 3),
+            "cum_pct": round(float(rs.sum()) * 100, 2)}
 
 
 def backtest_short(features: pd.DataFrame, price: pd.Series,
@@ -135,6 +157,11 @@ def backtest_short(features: pd.DataFrame, price: pd.Series,
     eng_p = float(binomtest(eng_correct, eng_n, 0.5).pvalue) if eng_n else None
     brier = float(np.mean((pu - ad) ** 2))
     clf_all_hit = float(np.mean(((pu >= 0.5) == (ad == 1))))
+    # —— 经济价值口径：胜率≠盈利能力。按表态方向取号持有 horizon，统计期望收益/盈亏比/
+    # 近似夏普；中性原点不持仓。另给"无条件买入持有"作对照，证明表态是否真有超额价值。
+    dir_sign = np.where(st == "看涨", 1.0, np.where(st == "看跌", -1.0, 0.0))
+    econ_engaged = _econ_summary((dir_sign * ar)[engaged], horizon)
+    econ_buyhold = _econ_summary(ar, horizon)
     # 门控证据（回测起点前估计，无泄漏）
     gate_edge = {}
     if gate_fc is not None and getattr(gate_fc, "dir_edge", None):
@@ -160,9 +187,18 @@ def backtest_short(features: pd.DataFrame, price: pd.Series,
         "direction_brier": round(brier, 3),
         "clf_direction_accuracy": round(clf_all_hit, 3),
         "gate_has_edge": bool(gate_edge.get("has_edge", False)),
+        "gate_edge_basis": gate_edge.get("edge_basis"),
         "gate_edge_hit": gate_edge.get("engaged_hit"),
         "gate_edge_p": gate_edge.get("engaged_p"),
         "gate_edge_n": gate_edge.get("n"),
+        # 经济价值（表态子集按立场持有 horizon；买入持有为对照）
+        "stance_engaged_mean_ret_pct": econ_engaged["mean_pct"],
+        "stance_engaged_payoff": econ_engaged["payoff"],
+        "stance_engaged_ret_p": econ_engaged["p"],
+        "stance_engaged_sharpe": econ_engaged["sharpe"],
+        "stance_engaged_cum_ret_pct": econ_engaged["cum_pct"],
+        "buyhold_mean_ret_pct": econ_buyhold["mean_pct"],
+        "buyhold_sharpe": econ_buyhold["sharpe"],
         # 参考/向后兼容字段（页面不再以其为主口径）
         "raw_direction_accuracy": round(raw_hits / evaluated, 3),
         "direction_accuracy": round(hits / evaluated, 3),

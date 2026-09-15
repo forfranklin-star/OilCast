@@ -463,6 +463,13 @@ def build_features(prices: pd.DataFrame, macro: pd.DataFrame,
     feats["ret_5d"] = log_t.diff(5)
     feats["ma_gap"] = log_t - log_t.rolling(20, min_periods=5).mean()
     feats["vol_20"] = daily_ret.rolling(20, min_periods=5).std()
+    # 多周期时序动量与中期趋势/波动状态：均为 t 时点可得（无未来信息）。日度方向近随机，
+    # 但严格无泄漏回测显示近 1 月(mom_21)趋势在月/季尺度存在"胜率不高、盈亏比>1"的正期望，
+    # 由模型层独立的"趋势期望"门控通道评估后才启用；mom_63/中期均线用于确认趋势、过滤假突破。
+    feats["mom_21"] = log_t.diff(21)
+    feats["mom_63"] = log_t.diff(63)
+    feats["ma_gap_120"] = log_t - log_t.rolling(120, min_periods=30).mean()
+    feats["vol_60"] = daily_ret.rolling(60, min_periods=10).std()
 
     # 重大事件 regime（新冠疫情、俄乌战争、红海危机、2026 美以伊战事等）：可审计的离散
     # 状态变量，窗口内取事件强度、否则 0，年表见 data/reference/major_events.yaml（公开事实
@@ -567,7 +574,8 @@ def factor_availability(features: pd.DataFrame) -> Dict[str, bool]:
     return avail
 
 
-TECHNICAL_COLS = ["ret_1d", "ret_5d", "ma_gap", "vol_20", "major_event_regime"]
+TECHNICAL_COLS = ["ret_1d", "ret_5d", "ma_gap", "vol_20", "mom_21", "mom_63",
+                  "ma_gap_120", "vol_60", "major_event_regime"]
 
 
 def make_supervised(features: pd.DataFrame, target_price: pd.Series,

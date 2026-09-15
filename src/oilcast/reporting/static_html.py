@@ -336,6 +336,9 @@ def _cards(report: dict) -> List[dict]:
                      "prob_up": ep["prob_up"] * 100, "prob_down": ep["prob_down"] * 100,
                      "stance": ep.get("dir_stance", "中性"),
                      "has_edge": bool(ep.get("dir_has_edge", False)),
+                     "basis": ep.get("dir_edge_basis"),
+                     "payoff": ep.get("dir_edge_payoff"),
+                     "mret": ep.get("dir_edge_mean_ret"),
                      "target": ep["target_date"]})
     return rows
 
@@ -471,7 +474,7 @@ TEMPLATE = r"""
       <div class="big {{ 'up' if c.pct>=0 else 'down' }}">{{ c.mean }} <span style="font-size:15px">美元/桶</span></div>
       <div class="{{ 'up' if c.pct>=0 else 'down' }}" style="font-size:14px">
         {{ '▲' if c.pct>=0 else '▼' }} {{ c.pct }}%（相对观测日）</div>
-      <div class="kv"><span>方向立场</span><b>{{ c.stance }}{% if c.stance!='中性' %}（门控通过）{% elif not c.has_edge %}（未达显著门控）{% endif %}</b></div>
+      <div class="kv"><span>方向立场</span><b>{{ c.stance }}{% if c.stance!='中性' and c.basis=='趋势期望' %}（趋势跟随：顺势均收 {{ c.mret }}%、盈亏比 {{ c.payoff }}）{% elif c.stance!='中性' %}（门控通过）{% elif not c.has_edge %}（未达显著门控）{% endif %}</b></div>
       <div class="kv"><span>95%概率区间</span><span>{{ c.range95 }}</span></div>
       <div class="kv"><span>看涨/看跌</span><span>{{ '%.0f'|format(c.prob_up) }}% / {{ '%.0f'|format(c.prob_down) }}%</span></div>
       <div class="probbar"><div class="u" style="width:{{c.prob_up}}%"></div><div class="d" style="width:{{c.prob_down}}%"></div></div>
@@ -627,6 +630,10 @@ TEMPLATE = r"""
      <div class="kv"><span>中性占比（不计为错误）</span><b>{{ (bt.stance_neutral_rate*100)|round(0) }}%</b></div>
      <div class="kv"><span>表态时方向命中（可比50%）</span><b>{{ (bt.stance_engaged_accuracy*100)|round(0) if bt.stance_engaged_accuracy is not none else '—' }}%{% if bt.stance_engaged_p is not none %}（p={{ bt.stance_engaged_p }}）{% endif %}</b></div>
      <div class="kv"><span>方向概率 Brier（越低越好）</span><b>{{ bt.direction_brier }}</b></div>
+     <div class="kv"><span>方向edge来源</span><b>{{ bt.gate_edge_basis if bt.gate_edge_basis else '—' }}</b></div>
+     <div class="kv"><span>表态平均收益（按立场持有）</span><b>{{ '%+.2f'|format(bt.stance_engaged_mean_ret_pct) if bt.stance_engaged_mean_ret_pct is not none else '—' }}%</b></div>
+     <div class="kv"><span>表态盈亏比（平均盈利/亏损）</span><b>{{ bt.stance_engaged_payoff if bt.stance_engaged_payoff is not none else '—' }}</b></div>
+     <div class="kv"><span>表态近似年化夏普</span><b>{{ bt.stance_engaged_sharpe if bt.stance_engaged_sharpe is not none else '—' }}（无条件持有均收 {{ bt.buyhold_mean_ret_pct }}%）</b></div>
      <div class="kv"><span>收益相关系数 IC</span><b>{{ bt.ic }}</b></div>
      <div class="kv"><span>随机游走基准 MAE</span><b>{{ bt.benchmark_mae_pct }}%</b></div>
      <div class="kv"><span>未校准原始模型 MAE</span><b>{{ bt.raw_mae_pct }}%（方向{{ (bt.raw_direction_accuracy*100)|round(0) }}%）</b></div>
