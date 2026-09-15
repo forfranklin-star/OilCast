@@ -93,6 +93,21 @@ def test_features_clean(bundle):
             assert c in feats.columns, c
 
 
+def test_nonpositive_price_does_not_emit_log_warning_or_inf(bundle):
+    # 脏数据里的 0/负价格必须在取对数前判为缺失：不产生 invalid value in log 告警，也无 -inf 入模
+    import warnings
+    prices = bundle.prices.copy()
+    prices.iloc[10, prices.columns.get_loc("wti")] = 0.0
+    prices.iloc[20, prices.columns.get_loc("brent")] = -3.0
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        feats = build_features(prices, bundle.macro, bundle.events,
+                               bundle.views, target="wti")
+    assert not [w for w in caught if "encountered in log" in str(w.message).lower()]
+    num = feats.select_dtypes(include=[np.number]).values
+    assert not np.isinf(num).any()
+
+
 def test_shanghai_usd_premium_and_jpy(bundle):
     # 上海原油：换算美元后必须能算出对布伦特的升贴水水平列；日元因素列须存在
     feats = build_features(bundle.prices, bundle.macro, bundle.events,

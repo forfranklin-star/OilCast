@@ -83,12 +83,14 @@ class ShortTermForecaster:
                  compute_residuals: bool = True,
                  calib_origins: Optional[int] = None,
                  calib_iter: Optional[int] = None,
-                 run_arima: bool = True,
+                 run_arima: bool = False,
                  dir_origins: Optional[int] = None) -> None:
         self.horizon = horizon
         self.window = window
         self.compute_residuals = compute_residuals
-        self.run_arima = run_arima   # 回测时可关闭耗时的 ARIMA 基准
+        # ARIMA 基准默认关闭：实测在无频率的交易日 index 上长期收敛失败、零贡献却每品种
+        # 串行试 3 阶、拖慢每日管线（已有随机游走基准作对照）；确需时显式 run_arima=True。
+        self.run_arima = run_arima
         # 内部样本外校准规模的可选覆盖（None=读 config）；回测/测试可用小值提速
         self.calib_origins_override = calib_origins
         self.calib_iter_override = calib_iter
@@ -158,7 +160,9 @@ class ShortTermForecaster:
             "parent_fitted_at": getattr(usable_warm, "train_meta", {}).get("fitted_at")
             if usable_warm is not None else None,
         }
-        log_p = np.log(price)
+        # 价格必须为正才能取对数：脏数据里的 0/负值先置为缺失（np.log 对 NaN 不告警、
+        # 由后续 valid_mask 自然剔除），避免 RuntimeWarning: invalid value in log 及 -inf 入模。
+        log_p = np.log(price.where(price > 0))
         min_rows = int(get_config()["model"].get("min_train_obs", 250))
         valid_mask = log_p.notna()        # 价格真实有效即可训练；特征缺失由模型原生处理
         n_valid = int(valid_mask.sum())
@@ -199,8 +203,17 @@ class ShortTermForecaster:
             self._rolling_residuals(X, log_p)
             if self.run_arima:
                 self._arima_benchmark(log_p)
-        # 方向层：长历史样本外概率校准 + edge 显著性门控 + 最终方向分类器（无泄漏）
-        self._direction_walkforward(X, log_p)
+        # 方向层：长历史样本外概率校准 + edge 显著性门控 + 最终方向分类器（无泄漏）。
+        # 门控 edge 是慢变统计（数百非重叠原点、回看约5年），每天全量重算代价大却几乎不变，
+        # 故当上期工件在 dir_gate_refresh_days 天内已算过门控时【复用其门控证据】、只重训最终
+        # 分类器（秒级），到期/冷启动/特征schema变化才全量重算——日常运行由此大幅提速，且
+        # edge 结论仍周期性刷新，原始库与最终分类器每天重训，持续学习不从零。
+        if self._reuse_direction_gate(usable_warm):
+            self._train_direction(X, log_p)
+        else:
+            self._direction_walkforward(X, log_p)
+            self.train_meta["gate_trained_date"] = self.train_meta["train_end"]
+            self.train_meta["gate_reused"] = False
         # 残差分位/波动/基准/校准β与上期做指数平滑：跨期累积、越估越稳（不从零）
         if usable_warm is not None and self.compute_residuals:
             a = float(mcfg.get("residual_ema_alpha", 0.7))
@@ -401,6 +414,44 @@ class ShortTermForecaster:
                                                     z["q75"] * sd, z["q95"] * sd])
                 self.resid_std[h] = float(sd)
 
+    def _reuse_direction_gate(self, warm) -> bool:
+        """门控证据跨期复用判定。返回 True 表示直接继承 warm 的门控(校准器/胜率edge/趋势edge)，
+        调用方只需重训最终方向分类器；False 表示需全量重算门控。
+
+        复用条件（任一不满足即全量重算，保证不漏新出现的 edge）：
+          - 不是回测/测试用 dir_origins 显式控制的场景；
+          - warm 确有完整门控证据（dir_calib/dir_edge/trend_edge）；
+          - warm 门控训练日距本期训练 end 在 dir_gate_refresh_days 个自然日内。
+        """
+        if self.dir_origins_override is not None or warm is None:
+            return False
+        for attr in ("dir_calib", "dir_edge", "trend_edge"):
+            obj = getattr(warm, attr, None)
+            if not obj:
+                return False
+        if not getattr(warm, "dir_models", None):
+            return False
+        prev_gate = (getattr(warm, "train_meta", {}) or {}).get("gate_trained_date")
+        if not prev_gate:
+            return False
+        try:
+            gap_days = (pd.Timestamp(self.train_meta["train_end"])
+                        - pd.Timestamp(prev_gate)).days
+        except Exception:
+            return False
+        refresh = int(get_config()["model"].get("dir_gate_refresh_days", 7))
+        if gap_days < 0 or gap_days > refresh:
+            return False
+        import copy
+        self.dir_calib = copy.deepcopy(warm.dir_calib)
+        self.dir_edge = copy.deepcopy(warm.dir_edge)
+        self.trend_edge = copy.deepcopy(warm.trend_edge)
+        self.dir_models = copy.deepcopy(warm.dir_models)
+        self.train_meta["gate_trained_date"] = prev_gate
+        self.train_meta["gate_reused"] = True
+        self.train_meta["gate_age_days"] = int(gap_days)
+        return True
+
     def _direction_walkforward(self, X: pd.DataFrame, log_p: pd.Series) -> None:
         """在较长历史上做严格无泄漏滚动原点，收集方向分类器的样本外涨跌概率，用于
         isotonic 校准与方向 edge 显著性门控，随后训练最终方向分类器。
@@ -438,9 +489,17 @@ class ShortTermForecaster:
         # 时序动量通道：mom_21 及"截至 t 的扩展中位数"作趋势强度下限（只用 ≤t 数据，无泄漏）
         mom21 = X["mom_21"] if "mom_21" in X.columns else pd.Series(np.nan, index=X.index)
         mom21_cut = mom21.abs().expanding(min_periods=60).median()
+        # 每个 h 的门控原点上限：步长始终取 h 的整数倍，抽稀后标签区间仍互不重叠
+        # （不破坏二项检验独立性），同时把 h=2 这类过密原点从数百压到上限内，显著降耗时。
+        cap = int(mcfg.get("dir_gate_max_origins_per_h", 150))
         for h in hs:
             first = max(win + 2, last - lookback)
-            origins = list(range(first, last - h + 1, h))   # 间隔=h，标签非重叠
+            raw_origins = list(range(first, last - h + 1, h))   # 间隔=h，标签非重叠
+            if len(raw_origins) > cap:
+                k = -(-len(raw_origins) // cap)                 # 向上取整，步长=k*h 仍非重叠
+                origins = raw_origins[::k]
+            else:
+                origins = raw_origins
             for t in origins:
                 # 趋势通道：mom_21 强度越过其历史中位数才记录"顺势持有 h"的实际对数收益
                 m21 = float(mom21.iloc[t]); cut = mom21_cut.iloc[t]
@@ -677,7 +736,9 @@ class ShortTermForecaster:
         """ARIMA 基准：阶数由高到低自动降级，收敛警告视为失败并重试更简模型。"""
         import warnings
         from statsmodels.tsa.arima.model import ARIMA
-        rets = log_p.diff().dropna().tail(250)
+        # 交易日 DatetimeIndex 无固定频率，statsmodels 会报 "No supported index is
+        # available"；重置为整数 RangeIndex 即可（ARIMA 只用序列次序，不依赖日历）。
+        rets = log_p.diff().dropna().tail(250).reset_index(drop=True)
         for order in ((2, 0, 2), (1, 0, 1), (1, 0, 0)):
             try:
                 with warnings.catch_warnings():

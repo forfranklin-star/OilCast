@@ -203,6 +203,9 @@ model:
   dir_gate_max_iter: 60     # 门控滚动在数百原点上反复拟合、只判 edge 是否存在，用较少迭代提速
   dir_gate_lookback: 1200   # 方向门控回看交易日（约5年）；每步长按h非重叠取原点，长历史
                             # 才能稳定判定方向edge（短窗噪声大、结论会在品种间偶然翻转）
+  dir_gate_max_origins_per_h: 150  # 每个周期门控原点上限：步长取h整数倍抽稀、标签仍非重叠，控耗时
+  dir_gate_refresh_days: 7  # 门控edge跨期复用天数：该自然日内每日只重训最终分类器、复用门控证据，
+                            # 到期/冷启动/特征schema变化才全量重算（edge是慢变统计，避免每日重跑数百模型）
   dir_conf_threshold: 0.62  # 校准后 P(涨)≥该值才明确看涨，≤1-该值(0.38)看跌，其间为中性
   edge_min_n: 20            # 判定方向 edge 所需的最小样本外原点总数
   edge_min_engaged: 8       # 其中高置信表态原点的最少个数

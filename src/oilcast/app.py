@@ -53,11 +53,14 @@ def load_report(date: str | None) -> dict | None:
 
 def run_pipeline() -> None:
     cmd = [sys.executable, "-m", "oilcast.pipeline.main"]
-    with st.spinner("正在采集真实数据、训练模型并生成报告，约需 1~3 分钟…"):
+    with st.spinner("正在采集真实数据、训练模型并生成报告；首次冷启动约 3~5 分钟，"
+                    "之后每日复用门控证据约 1~2 分钟，请勿关闭或刷新页面…"):
         proc = subprocess.run(cmd, cwd=str(PROJECT_ROOT / "src"),
                               capture_output=True, text=True)
     if proc.returncode not in (0,):
         st.error(f"流水线失败（退出码 {proc.returncode}）：{proc.stderr[-1500:]}")
+        st.info("若因运行过久被中断（operation was canceled）：每个品种训练完会立即存盘，"
+                "再点一次本按钮即可对已完成品种秒级续跑、只补未完成品种，无需从头开始。")
     else:
         st.success("报告已更新")
         st.cache_data.clear()

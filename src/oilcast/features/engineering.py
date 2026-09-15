@@ -431,6 +431,16 @@ def build_features(prices: pd.DataFrame, macro: pd.DataFrame,
         return d
     prices = _dedup_trading_index(prices)
     macro = _dedup_trading_index(macro)
+    # 取对数前统一清洗：价格与必须为正的汇率(usdjpy)列，把非有限/0/负值脏数据置为 NaN，
+    # 交给下游 ffill/缺失处理，杜绝 np.log 对 0/负值报 "invalid value encountered in log"
+    # 并产生 -inf 污染特征（不删除交易日、不补值，仅把非法价格点判为缺失，符合不造假约束）。
+    prices = prices.apply(
+        lambda s: pd.to_numeric(s, errors="coerce").where(
+            lambda x: np.isfinite(x.astype(float)) & (x > 0)))
+    if "usdjpy" in macro.columns:
+        _jpy = pd.to_numeric(macro["usdjpy"], errors="coerce")
+        macro = macro.copy()
+        macro["usdjpy"] = _jpy.where(np.isfinite(_jpy.astype(float)) & (_jpy > 0))
     # 交易时段对齐：prices/macro 在本函数作用域内替换为"目标视角下时点无泄漏"的面板
     if use_session_align:
         prices, macro = align_exogenous_to_target(prices, macro, target)
