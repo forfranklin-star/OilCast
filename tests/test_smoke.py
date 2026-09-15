@@ -804,13 +804,19 @@ def _direction_panel(predictable: bool, n: int = 1500, h: int = 5, seed: int = 1
     随机游走：未来收益与 signal 独立（弱有效市场，不应被判出稳定 edge）。"""
     rng = np.random.default_rng(seed)
     idx = pd.bdate_range("2019-01-02", periods=n)
-    sig = rng.normal(size=n)
-    r = rng.normal(0, 0.004, n)
+    daily = rng.normal(0, 0.004, n)              # 日对数收益
+    price = pd.Series(70.0 * np.exp(np.cumsum(daily)), index=idx)
+    # 未来 h 日累计收益（方向分类器要预测的目标），末端 h 个无定义
+    fwd = np.full(n, np.nan)
+    for t in range(n - h):
+        fwd[t] = daily[t + 1:t + 1 + h].sum()
     if predictable:
-        for t in range(n - h):
-            for k in range(1, h + 1):
-                r[t + k] += 0.006 * np.sign(sig[t])
-    price = pd.Series(70.0 * np.exp(np.cumsum(r)), index=idx)
+        # 信号 = 未来 h 日收益方向的强带噪观测：符号与目标高度一致、幅度单调，
+        # 浅树(FAST,iter30)与深树(生产,iter120)都能稳定学到"信号越强、上涨概率单调升高"，
+        # 不会因重叠注入/右尾分箱在不同 sklearn 版本下翻转。
+        sig = np.sign(np.nan_to_num(fwd)) * 1.0 + rng.normal(0, 0.3, n)
+    else:
+        sig = rng.normal(size=n)                 # 与未来收益独立：弱有效市场，无稳定 edge
     X = pd.DataFrame({"signal": sig, "noise_a": rng.normal(size=n),
                       "noise_b": rng.normal(size=n)}, index=idx)
     return X, price
@@ -837,9 +843,13 @@ def test_direction_gate_engages_when_edge_is_real():
     gate5 = fc.dir_edge.get(5, {})
     assert gate5.get("has_edge") is True, f"真实edge应被门控识别: {gate5}"
     assert gate5.get("engaged_hit", 0) >= 0.55
+    # 当前点喂入分布内的明确强正信号（合成信号=未来方向的强带噪观测，取值约 ±1）：
+    # FAST(浅树)与生产(深树)、跨 sklearn 版本下校准概率都稳定越过看涨阈值 0.62。
+    x_last = X.iloc[[-1]].copy()
+    x_last["signal"] = 1.0
     future = pd.bdate_range(X.index[-1] + pd.Timedelta(days=1), periods=5)
-    ep = fc.predict(X.iloc[[-1]], float(price.iloc[-1]), future).endpoint
-    assert ep["dir_stance"] in ("看涨", "看跌")
+    ep = fc.predict(x_last, float(price.iloc[-1]), future).endpoint
+    assert ep["dir_stance"] == "看涨", f"强正信号应稳定看涨, got {ep['dir_stance']} / {ep}"
 
 
 def test_backtest_three_class_metrics():
