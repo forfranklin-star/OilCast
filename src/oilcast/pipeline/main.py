@@ -693,7 +693,8 @@ def _persist_forecasts(db: OilCastDB, report_date: str, report: dict) -> None:
                 "target_date": p.get("target_date") or p.get("date"), "mean": p["mean"],
                 "q05": p.get("q05"), "q25": p.get("q25"), "q50": p.get("q50", p["mean"]),
                 "q75": p.get("q75"), "q95": p.get("q95"),
-                "prob_up": p.get("prob_up"), "prob_down": p.get("prob_down")}
+                "prob_up": p.get("prob_up"), "prob_down": p.get("prob_down"),
+                "dir_stance": p.get("dir_stance", "中性")}
     records = []
     for horizon, pack in report["forecasts"].items():
         for inst, item in pack.items():

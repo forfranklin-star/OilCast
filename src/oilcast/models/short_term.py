@@ -13,8 +13,10 @@ from typing import Dict, Optional
 
 import numpy as np
 import pandas as pd
-from scipy.stats import norm
-from sklearn.ensemble import HistGradientBoostingRegressor
+from scipy.stats import norm, binomtest
+from sklearn.ensemble import (
+    HistGradientBoostingRegressor, HistGradientBoostingClassifier)
+from sklearn.isotonic import IsotonicRegression
 
 from ..config import get_config
 from ..utils import get_logger
@@ -81,7 +83,8 @@ class ShortTermForecaster:
                  compute_residuals: bool = True,
                  calib_origins: Optional[int] = None,
                  calib_iter: Optional[int] = None,
-                 run_arima: bool = True) -> None:
+                 run_arima: bool = True,
+                 dir_origins: Optional[int] = None) -> None:
         self.horizon = horizon
         self.window = window
         self.compute_residuals = compute_residuals
@@ -89,6 +92,8 @@ class ShortTermForecaster:
         # 内部样本外校准规模的可选覆盖（None=读 config）；回测/测试可用小值提速
         self.calib_origins_override = calib_origins
         self.calib_iter_override = calib_iter
+        # 方向门控滚动原点个数的可选覆盖（None=读 config.dir_gate_origins）
+        self.dir_origins_override = dir_origins
         self.models: Dict[int, HistGradientBoostingRegressor] = {}
         self.resid_quantiles: Dict[int, np.ndarray] = {}
         self.resid_std: Dict[int, float] = {}
@@ -99,6 +104,13 @@ class ShortTermForecaster:
         self.cum_iters: Dict[int, int] = {}
         self.per_step_iter = 250       # 每个 direct 模型单轮新增迭代数
         self.arima_cumret = None
+        # —— 方向概率分类层（与幅度回归解耦）——
+        # dir_models: 各 anchor 步长的涨跌分类器；dir_calib: 样本外 isotonic 概率校准器；
+        # dir_edge: 各步长样本外方向 edge 是否统计成立（命中率/二项p/样本数）。全部随工件
+        # joblib 持久化，跨重启保留（持续学习，不从零）。
+        self.dir_models: Dict[int, HistGradientBoostingClassifier] = {}
+        self.dir_calib: Dict[int, Optional[IsotonicRegression]] = {}
+        self.dir_edge: Dict[int, dict] = {}
 
     # ------------------------------------------------------------- fit
     def fit(self, X: pd.DataFrame, price: pd.Series,
@@ -184,6 +196,8 @@ class ShortTermForecaster:
             self._rolling_residuals(X, log_p)
             if self.run_arima:
                 self._arima_benchmark(log_p)
+        # 方向层：长历史样本外概率校准 + edge 显著性门控 + 最终方向分类器（无泄漏）
+        self._direction_walkforward(X, log_p)
         # 残差分位/波动/基准/校准β与上期做指数平滑：跨期累积、越估越稳（不从零）
         if usable_warm is not None and self.compute_residuals:
             a = float(mcfg.get("residual_ema_alpha", 0.7))
@@ -217,6 +231,11 @@ class ShortTermForecaster:
             self.train_meta["calib_beta"] = {int(k): round(float(v), 3)
                                             for k, v in self.calib_beta.items()}
             self.train_meta["calib_beta_h"] = round(float(self.calib_beta.get(self.horizon, 0)), 3)
+        # 方向门控证据（样本外命中率/二项p/是否成立）写入元信息，供页面与审计展示
+        if getattr(self, "dir_edge", None):
+            self.train_meta["direction_gate"] = {
+                int(h): {k: v for k, v in ev.items() if k != "conf_threshold"}
+                for h, ev in self.dir_edge.items()}
         return self
 
     def _fallback_quantiles(self, h: int) -> np.ndarray:
@@ -379,6 +398,187 @@ class ShortTermForecaster:
                                                     z["q75"] * sd, z["q95"] * sd])
                 self.resid_std[h] = float(sd)
 
+    def _direction_walkforward(self, X: pd.DataFrame, log_p: pd.Series) -> None:
+        """在较长历史上做严格无泄漏滚动原点，收集方向分类器的样本外涨跌概率，用于
+        isotonic 校准与方向 edge 显著性门控，随后训练最终方向分类器。
+
+        方向 edge 是相对稳定的统计性质，不能只靠 β 残差那 30 个近端原点估计（会时灵时
+        不灵），故单独用更长的原点序列。每个原点 t 仅用 ≤t 数据训练（训练标签 shift(-h)
+        在切片末端自然为 NaN、终点≤t），预测 t→t+h 实际方向，绝无标签越界。"""
+        mcfg = get_config()["model"]
+        hs = [h for h in RESIDUAL_HORIZONS if h <= self.horizon]
+        # dir_origins 显式传 0：跳过门控滚动收集（复用外部已注入的 dir_calib/dir_edge，
+        # 供回测逐原点提速），只训练最终方向分类器。
+        if self.dir_origins_override == 0:
+            self.dir_calib = getattr(self, "dir_calib", None) or {}
+            self.dir_edge = getattr(self, "dir_edge", None) or {}
+            self._train_direction(X, log_p)
+            return
+        # 门控回看长度（交易日）。方向 edge 是稳定统计性质，短窗（如近 300 日）噪声大、
+        # 结论会在品种间偶然翻转；用多年历史、且每个步长按 h 非重叠取原点（标签不重叠，
+        # 显著性不被高估），结论才与长样本无泄漏回测一致。dir_origins_override>0 时按
+        # "回看 origin*h 个交易日"近似，供回测/测试压缩规模。
+        win = self.train_window
+        iters = int(mcfg.get("dir_clf_max_iter", 200))
+        if self.dir_origins_override:
+            lookback = self.dir_origins_override * max(hs)
+        else:
+            lookback = int(mcfg.get("dir_gate_lookback", 1200))
+        n = len(X)
+        last = n - 1
+        dir_pa: Dict[int, list] = {h: [] for h in hs}
+        for h in hs:
+            first = max(win + 2, last - lookback)
+            origins = list(range(first, last - h + 1, h))   # 间隔=h，标签非重叠
+            for t in origins:
+                lo = max(0, t - win + 1)
+                tr_X = X.iloc[lo:t + 1]
+                tr_log = log_p.iloc[lo:t + 1]
+                yy = tr_log.shift(-h) - tr_log
+                valid = yy.notna()
+                if int(valid.sum()) < 60:
+                    continue
+                yd = (yy[valid] > 0).astype(int)
+                Xf = tr_X.loc[yd.index]
+                if yd.nunique() < 2:
+                    continue
+                keep = _hgb_fit_columns(Xf)
+                if not keep:
+                    continue
+                try:
+                    clf = HistGradientBoostingClassifier(
+                        max_depth=4, max_iter=iters, learning_rate=0.05,
+                        min_samples_leaf=15, random_state=42)
+                    clf.fit(Xf[keep], yd)
+                    p_up = float(clf.predict_proba(X[keep].iloc[[t]])[0, 1])
+                    actual_dir = int(log_p.iloc[t + h] > log_p.iloc[t])
+                    if np.isfinite(p_up):
+                        dir_pa[h].append((p_up, actual_dir))
+                except Exception:
+                    continue
+        self._fit_direction_gate(hs, dir_pa, mcfg)
+        self._train_direction(X, log_p)
+
+    @staticmethod
+    def _crossfit_calibrated_prob(rp: np.ndarray, ad: np.ndarray,
+                                  n_splits: int = 5) -> np.ndarray:
+        """顺序 K 折交叉拟合，返回每个原点的 out-of-fold 校准概率（评估 edge 专用）。"""
+        n = len(rp)
+        cal = np.empty(n, dtype=float)
+        folds = np.array_split(np.arange(n), n_splits)
+        for fold in folds:
+            mask = np.ones(n, dtype=bool)
+            mask[fold] = False
+            if len(np.unique(rp[mask])) >= 2 and len(np.unique(ad[mask])) == 2:
+                iso = IsotonicRegression(out_of_bounds="clip", y_min=0.02,
+                                         y_max=0.98).fit(rp[mask], ad[mask])
+                cal[fold] = np.clip(iso.predict(rp[fold]), 0.02, 0.98)
+            else:
+                cal[fold] = rp[fold]   # 训练折信息不足时回退原始概率，不强行校准
+        return cal
+
+    def _fit_direction_gate(self, hs, dir_pa, mcfg) -> None:
+        """用滚动原点【样本外】涨跌概率做 isotonic 概率校准，并检验该步长方向 edge 是否
+        统计成立。只有"高置信表态命中率显著高于 50%"时 has_edge=True，方向才允许明确表态；
+        否则方向判中性（弱有效市场下诚实不表态），避免被 β 压平后又把中性计成方向错误。"""
+        thr = float(mcfg.get("dir_conf_threshold", 0.62))
+        margin = thr - 0.5
+        min_n = int(mcfg.get("edge_min_n", 20))
+        min_eng = int(mcfg.get("edge_min_engaged", 8))
+        min_hit = float(mcfg.get("edge_min_hit", 0.55))
+        max_p = float(mcfg.get("edge_max_p", 0.20))
+        self.dir_calib, self.dir_edge = {}, {}
+        for h in hs:
+            arr = dir_pa.get(h, [])
+            base = dict(conf_threshold=thr, n=len(arr))
+            if len(arr) < min_n:
+                self.dir_calib[h] = None
+                self.dir_edge[h] = {**base, "has_edge": False, "engaged_n": 0,
+                                    "engaged_hit": None, "engaged_p": None,
+                                    "all_hit": None, "reason": "样本外原点不足"}
+                continue
+            rp = np.array([a[0] for a in arr], dtype=float)
+            ad = np.array([a[1] for a in arr], dtype=int)
+            # 部署用校准器：用全部样本外点拟合（预测的是未来新点，无泄漏）
+            iso = None
+            if len(np.unique(rp)) >= 2 and len(np.unique(ad)) == 2:
+                iso = IsotonicRegression(out_of_bounds="clip", y_min=0.02,
+                                         y_max=0.98).fit(rp, ad)
+            # edge 评估必须用【交叉拟合 out-of-fold】校准概率：评估某原点时校准器由其余
+            # 原点拟合，绝不用该原点自身的实际方向校准后再评它，否则 isotonic 记忆样本、
+            # 系统性虚高"高置信命中"（样本内校准泄漏，曾让无 edge 的 WTI 假性达标）。
+            cal = self._crossfit_calibrated_prob(rp, ad)
+            engaged = np.abs(cal - 0.5) >= margin
+            en = int(engaged.sum())
+            eh = int(((cal[engaged] >= 0.5) == (ad[engaged] == 1)).sum()) if en else 0
+            all_hit = float(((cal >= 0.5) == (ad == 1)).mean())
+            hit = eh / en if en else 0.5
+            p_val = float(binomtest(eh, en, 0.5).pvalue) if en else 1.0
+            has_edge = bool(len(arr) >= min_n and en >= min_eng
+                            and hit >= min_hit and p_val <= max_p)
+            self.dir_calib[h] = iso
+            self.dir_edge[h] = {**base, "has_edge": has_edge, "engaged_n": en,
+                                "engaged_hit": round(hit, 3), "engaged_p": round(p_val, 3),
+                                "all_hit": round(all_hit, 3)}
+
+    def _train_direction(self, X: pd.DataFrame, log_p: pd.Series) -> None:
+        """对每个 anchor 步长用最近滚动窗训练最终涨跌分类器。严格无泄漏：标签
+        y=logP[t+h]-logP[t] 由 shift(-h) 构造，末端 h 行标签为 NaN 被剔除，训练样本标签
+        终点不超过最新交易日；与对应回归模型使用完全相同的入模列。"""
+        mcfg = get_config()["model"]
+        iters = int(mcfg.get("dir_clf_max_iter", 200))
+        hs = sorted(self.dir_edge.keys()) or [h for h in RESIDUAL_HORIZONS
+                                              if h <= self.horizon]
+        self.dir_models = {}
+        for h in hs:
+            yd = (log_p.shift(-h) - log_p > 0).astype(int)
+            valid = (log_p.shift(-h) - log_p).notna()
+            yv, Xv = yd[valid], X.loc[valid.index[valid]]
+            if self.train_window > 0:
+                yv, Xv = yv.tail(self.train_window), Xv.tail(self.train_window)
+            if yv.nunique() < 2:
+                continue
+            reg = self.models.get(h)
+            keep = getattr(reg, "_oilcast_fit_cols", None) or _hgb_fit_columns(Xv)
+            keep = [c for c in keep if c in Xv.columns]
+            if not keep:
+                continue
+            clf = HistGradientBoostingClassifier(
+                max_depth=4, max_iter=iters, learning_rate=0.05,
+                min_samples_leaf=15, random_state=42)
+            clf.fit(Xv[keep], yv)
+            clf._oilcast_fit_cols = list(keep)
+            self.dir_models[h] = clf
+
+    def direction_at(self, x_row: pd.DataFrame, h: Optional[int] = None):
+        """返回某步长（默认 horizon）的 (校准后看涨概率, 方向立场, edge证据)。
+
+        方向立场三分类：仅当该步长样本外方向 edge 统计成立、且校准概率越过置信阈值时才
+        明确看涨/看跌，否则一律"中性"。无方向分类器（旧工件/未校准）时安全回退中性。"""
+        h = self.horizon if h is None else h
+        anchors = sorted(self.dir_models.keys())
+        if not anchors:
+            return 0.5, "中性", {"has_edge": False, "reason": "无方向分类器"}
+        ha = min(anchors, key=lambda k: abs(k - h))
+        clf = self.dir_models[ha]
+        cols = getattr(clf, "_oilcast_fit_cols", None)
+        raw = float(clf.predict_proba(x_row[cols] if cols is not None else x_row)[0, 1])
+        iso = self.dir_calib.get(ha)
+        if iso is not None:
+            p = float(np.clip(iso.predict([raw])[0], 0.02, 0.98))
+        else:
+            p = float(np.clip(raw, 0.02, 0.98))
+        edge = dict(self.dir_edge.get(ha, {})); edge["anchor"] = ha
+        thr = float(edge.get("conf_threshold", 0.62))
+        has = bool(edge.get("has_edge", False))
+        if has and p >= thr:
+            stance = "看涨"
+        elif has and p <= 1 - thr:
+            stance = "看跌"
+        else:
+            stance = "中性"
+        return p, stance, edge
+
     def _arima_benchmark(self, log_p: pd.Series) -> None:
         """ARIMA 基准：阶数由高到低自动降级，收敛警告视为失败并重试更简模型。"""
         import warnings
@@ -447,9 +647,17 @@ class ShortTermForecaster:
         last = path.iloc[-1]
         std = self.resid_std.get(self.horizon, self.ret_std * np.sqrt(self.horizon))
         if not np.isfinite(std) or std <= 1e-9:
-            prob_up = 0.5   # 波动尺度不可用时方向概率取中性，绝不输出 NaN
+            mag_prob = 0.5   # 波动尺度不可用时幅度隐含概率取中性，绝不输出 NaN
         else:
-            prob_up = float(norm.cdf(last["_cumret"] / std))
+            mag_prob = float(norm.cdf(last["_cumret"] / std))
+        # 方向以独立的概率分类器（样本外 isotonic 校准 + 显著性门控）为准；幅度隐含概率
+        # mag_prob 仅作对照。无分类器（旧工件）时回退到幅度隐含概率、立场中性。
+        if getattr(self, "dir_models", None):
+            dir_prob, stance, edge = self.direction_at(x_base, self.horizon)
+        else:
+            dir_prob, stance, edge = mag_prob, "中性", {"has_edge": False,
+                                                       "reason": "旧工件无方向分类器"}
+        prob_up = dir_prob if getattr(self, "dir_models", None) else mag_prob
         endpoint = {
             "target_date": pd.Timestamp(path.index[-1]).strftime("%Y-%m-%d"),
             "mean": round(float(last["mean"]), 2),
@@ -457,6 +665,13 @@ class ShortTermForecaster:
             "q75": round(float(last["q75"]), 2), "q95": round(float(last["q95"]), 2),
             "pct_mean": round((float(last["mean"]) / last_price - 1) * 100, 2),
             "prob_up": round(prob_up, 3), "prob_down": round(1 - prob_up, 3),
+            "mag_prob_up": round(mag_prob, 3),
+            "dir_prob_up": round(dir_prob, 3),
+            "dir_stance": stance,
+            "dir_has_edge": bool(edge.get("has_edge", False)),
+            "dir_edge_hit": edge.get("engaged_hit"),
+            "dir_edge_p": edge.get("engaged_p"),
+            "dir_edge_n": edge.get("n"),
         }
         bench = None
         if getattr(self, "arima_cumret", None) is not None:

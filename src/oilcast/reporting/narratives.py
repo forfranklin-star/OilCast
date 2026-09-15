@@ -51,23 +51,36 @@ def trend_narrative(prices: pd.Series, name: str, unit: str) -> str:
 
 
 def forecast_narrative(ep: dict, name: str, unit: str, horizon_cn: str) -> str:
-    # β 校准后点预测接近 0、方向概率接近 50%：近期样本外无可靠方向优势，模型主动退守
-    # 随机游走（维持观测日价），如实说明而非强行给出涨跌方向
-    if abs(ep.get("pct_mean", 0)) < 0.05 and abs(ep.get("prob_up", 0.5) - 0.5) < 0.03:
-        return (f"未来{horizon_cn}，模型对{name}的近期样本外方向信号不足（校准系数 β 趋近 0），"
-                f"预测均值 {ep['mean']:.2f} {unit}、基本维持观测日水平，即退守随机游走基准；"
-                f"50%概率区间 [{ep['q25']}, {ep['q75']}]，95%概率区间 [{ep['q05']}, {ep['q95']}]，"
-                f"看涨/看跌概率均约 50%。这表示在当前噪声水平下模型不主张方向性押注，"
-                f"而非看空；一旦出现可持续趋势信号，β 会自动升高、预测随之偏离基准。"
-                f"预测仅基于截至观测日的真实数据，不构成投资建议。")
-    direction = "上涨" if ep["pct_mean"] > 0 else "下跌"
-    prob = ep["prob_up"] * 100 if ep["pct_mean"] >= 0 else ep["prob_down"] * 100
-    return (f"未来{horizon_cn}，模型对{name}的预测均值为 {ep['mean']:.2f} {unit}"
-            f"（较观测日{direction} {abs(ep['pct_mean']):.2f}%），"
-            f"50%概率区间 [{ep['q25']}, {ep['q75']}]，95%概率区间 [{ep['q05']}, {ep['q95']}]；"
-            f"方向概率：看涨 {ep['prob_up']*100:.0f}% / 看跌 {ep['prob_down']*100:.0f}%，"
-            f"模型对{('上行' if ep['pct_mean'] >= 0 else '下行')}方向置信度约 {prob:.0f}%。"
-            f"预测仅基于截至观测日的真实数据，不构成投资建议。")
+    """方向以独立概率分类器 + 样本外显著性门控为准（看涨/看跌/中性三分类）。
+
+    无统计 edge 或概率未越置信阈值时诚实判中性（弱有效市场下不硬押方向），并说明这是
+    证据不足而非看空；有 edge 且明确表态时，给出校准概率与该周期样本外表态命中证据。
+    """
+    stance = ep.get("dir_stance", "中性")
+    p_up = float(ep.get("dir_prob_up", ep.get("prob_up", 0.5)))
+    iv = (f"50%概率区间 [{ep['q25']}, {ep['q75']}]，95%概率区间 [{ep['q05']}, {ep['q95']}]")
+    edge_txt = ""
+    if ep.get("dir_has_edge") and ep.get("dir_edge_hit") is not None:
+        edge_txt = (f"该周期历史样本外高置信表态命中率约 {ep['dir_edge_hit']*100:.0f}%"
+                    + (f"（二项检验 p={ep['dir_edge_p']}）" if ep.get("dir_edge_p") is not None else "")
+                    + "，方向信号通过显著性门控；")
+    if stance == "中性":
+        reason = ("该周期方向未通过样本外显著性门控" if not ep.get("dir_has_edge")
+                  else "校准后涨跌概率未达到明确表态阈值")
+        return (f"未来{horizon_cn}，模型对{name}不主张明确方向（{reason}）：预测均值 "
+                f"{ep['mean']:.2f} {unit}（较观测日 {ep['pct_mean']:+.2f}%），{iv}，"
+                f"校准后看涨概率 {p_up*100:.0f}%、看跌 {(1-p_up)*100:.0f}%，接近均衡。"
+                f"这表示在当前噪声水平下没有统计上可靠的方向优势、以区间刻画不确定性，"
+                f"而非看空；预测仅基于截至观测日的真实数据，不构成投资建议。")
+    if stance == "看涨":
+        return (f"未来{horizon_cn}，模型明确【看涨】{name}：预测均值 {ep['mean']:.2f} {unit}"
+                f"（较观测日 +{abs(ep['pct_mean']):.2f}%），{iv}；{edge_txt}校准后看涨概率 "
+                f"{p_up*100:.0f}% / 看跌 {(1-p_up)*100:.0f}%。预测仅基于截至观测日的真实数据，"
+                f"不构成投资建议。")
+    return (f"未来{horizon_cn}，模型明确【看跌】{name}：预测均值 {ep['mean']:.2f} {unit}"
+            f"（较观测日 -{abs(ep['pct_mean']):.2f}%），{iv}；{edge_txt}校准后看跌概率 "
+            f"{(1-p_up)*100:.0f}% / 看涨 {p_up*100:.0f}%。预测仅基于截至观测日的真实数据，"
+            f"不构成投资建议。")
 
 
 def weights_narrative(weights: pd.DataFrame) -> str:
@@ -186,13 +199,7 @@ def learning_narrative(ml: dict) -> str:
                    f"{tw} 个交易日滚动窗拟合、截至 {first.get('train_end','')}")
     if isinstance(bt, dict) and bt.get("available"):
         beat = "跑赢" if bt["mae_pct"] < bt["benchmark_mae_pct"] else "暂未跑赢"
-        if bt.get("engagement_rate") == 0:
-            dir_txt = "近期 10 日视野样本外无方向优势、模型全程退守随机游走、不硬赌方向"
-        elif bt.get("engaged_direction_accuracy") is not None:
-            dir_txt = (f"明确表态占比 {bt['engagement_rate']*100:.0f}%、表态时方向命中 "
-                       f"{bt['engaged_direction_accuracy']*100:.0f}%")
-        else:
-            dir_txt = f"方向命中率 {bt['direction_accuracy']*100:.0f}%"
+        dir_txt = _stance_txt(bt)
         seg.append(f"滚动样本外回测 {bt['n_origins']} 个原点，MAE {bt['mae_pct']}%、"
                    f"{dir_txt}，相对随机游走基准（{bt['benchmark_mae_pct']}%）{beat}")
     if isinstance(rv, dict) and rv.get("available"):
@@ -213,6 +220,25 @@ def learning_narrative(ml: dict) -> str:
         elif mods:
             seg.append("本期为冷启动训练，模型工件已落盘，此后每期在上期基础上热启动持续学习")
     return "；".join(seg) + "。权重每日向新数据学习并与上期平滑，全过程仅使用真实观测。"
+def _stance_txt(bt: dict) -> str:
+    """三分类方向口径的一句话总结（看涨/看跌/中性，中性不计错）。"""
+    er = bt.get("stance_engagement_rate")
+    acc = bt.get("stance_engaged_accuracy")
+    if er is None:
+        return "方向指标暂缺"
+    if er == 0:
+        return ("该周期样本外方向未通过显著性门控、回测期全程判中性（不硬赌方向，"
+                "中性不计为错误）")
+    p_txt = f"、二项检验 p={bt.get('stance_engaged_p')}" if bt.get("stance_engaged_p") is not None else ""
+    base = (f"明确表态占比 {er*100:.0f}%、其余 {bt.get('stance_neutral_rate', 0)*100:.0f}% 判中性，"
+            f"表态时方向命中 {acc*100:.0f}%{p_txt}" if acc is not None else f"明确表态占比 {er*100:.0f}%")
+    if bt.get("gate_has_edge"):
+        base += "，该周期方向 edge 通过显著性门控"
+    else:
+        base += "，该周期方向 edge 未通过门控、以中性为主"
+    return base
+
+
 def backtest_narrative(bt: dict) -> Optional[str]:
     if not bt or not bt.get("available"):
         return None
@@ -223,33 +249,26 @@ def backtest_narrative(bt: dict) -> Optional[str]:
     if bt.get("window_start") and bt.get("window_end"):
         span = f"{bt['window_start']} 至 {bt['window_end']}、"
     imp_txt = f"，误差较基准降低 {imp}%" if (beat and imp is not None) else ""
-    raw_mae = bt.get("raw_mae_pct")
-    cal_txt = ""
-    if raw_mae is not None:
-        cal_txt = (f"未经 β 校准的原始模型误差为 {raw_mae}%、方向命中 "
-                   f"{bt.get('raw_direction_accuracy', 0)*100:.0f}%，"
-                   f"经样本外 β 校准后误差降至 {bt['mae_pct']}%——"
-                   f"模型在近期缺乏预测力的时段会自动收缩、退守随机游走以避免跑输，"
-                   f"在出现真实趋势信号时才按可信比例放大；")
-    eng_txt = ""
-    if bt.get("engagement_rate") is not None and bt.get("engaged_direction_accuracy") is not None:
-        eng_txt = (f"全原点二分方向命中率 {bt['direction_accuracy']*100:.0f}%（β 退守、预测≈持平时"
-                   f"中性也被计为错，故偏低）；其中模型明确表态的原点占 "
-                   f"{bt['engagement_rate']*100:.0f}%，表态时方向命中 "
-                   f"{bt['engaged_direction_accuracy']*100:.0f}%（这才是可与抛硬币 50% 比较的口径），")
-    elif bt.get("engagement_rate") is not None and bt.get("engagement_rate", 0) == 0:
-        eng_txt = (f"样本外校准系数极小、{bt['n_origins']} 个原点上模型在 {bt['horizon_td']} 日视野"
-                   f"全部选择退守随机游走、未明确表达方向（明确表态占比 0%），此时二分方向命中率 "
-                   f"{bt['direction_accuracy']*100:.0f}% 不具方向评价意义——它衡量的是一个主动"
-                   f"不赌方向的模型，价值体现在误差控制与区间覆盖而非猜方向，")
+    # 三分类方向口径
+    er = bt.get("stance_engagement_rate", 0)
+    if er == 0:
+        dir_txt = (f"方向采用看涨/看跌/中性三分类：{bt['n_origins']} 个样本外原点上该周期方向"
+                   f"均未通过显著性门控、全部判中性（中性是弱有效市场下的诚实选择，不计为错误），"
+                   f"概率 Brier {bt.get('direction_brier', '-')}；")
     else:
-        eng_txt = f"方向命中率 {bt['direction_accuracy']*100:.0f}%，"
+        acc = bt.get("stance_engaged_accuracy")
+        p_txt = (f"，相对抛硬币的二项检验 p={bt.get('stance_engaged_p')}"
+                 if bt.get("stance_engaged_p") is not None else "")
+        gate = "方向 edge 通过门控" if bt.get("gate_has_edge") else "方向 edge 未通过门控"
+        dir_txt = (f"方向采用看涨/看跌/中性三分类：明确表态占比 {er*100:.0f}%、"
+                   f"{bt.get('stance_neutral_rate', 0)*100:.0f}% 判中性，表态原点方向命中 "
+                   f"{acc*100:.0f}%{p_txt}（{gate}），概率 Brier {bt.get('direction_brier', '-')}；")
     return (f"近期滚动回测（{span}{bt['n_origins']} 个样本外原点、{bt['horizon_td']} 交易日视野，"
-            f"每个原点均只用当时可得数据、按 500 交易日滚动窗拟合，全程无未来泄漏）："
-            f"{cal_txt}{eng_txt}"
-            f"预测与实际累计收益相关系数 {bt.get('ic', 0):.2f}；随机游走基准误差 "
-            f"{bt['benchmark_mae_pct']}%，本模型{cmp_word}{imp_txt}。日频 10 日方向信噪比"
-            f"天然偏低，方向命中长期围绕 50% 波动属正常，系统不以过拟合或未来函数制造虚高数字。")
+            f"每个原点均只用当时可得数据、按滚动训练窗拟合，门控只用回测起点之前数据，全程无未来"
+            f"泄漏）：幅度 MAE {bt['mae_pct']}%，{dir_txt}预测与实际累计收益相关系数 "
+            f"{bt.get('ic', 0):.2f}；随机游走基准误差 {bt['benchmark_mae_pct']}%，"
+            f"本模型{cmp_word}{imp_txt}。全球定价的原油日度方向信噪比天然偏低、长期围绕 50% "
+            f"波动属正常，系统只在样本外显著时才明确表态，不以过拟合或未来函数制造虚高命中。")
 
 
 def lineage_narrative(bundle) -> str:

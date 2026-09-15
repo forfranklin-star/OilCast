@@ -334,6 +334,8 @@ def _cards(report: dict) -> List[dict]:
         rows.append({"horizon": HORIZON_CN[hz], "unavailable": False, "mean": ep["mean"],
                      "range95": f"{ep['q05']} ~ {ep['q95']}", "pct": ep["pct_mean"],
                      "prob_up": ep["prob_up"] * 100, "prob_down": ep["prob_down"] * 100,
+                     "stance": ep.get("dir_stance", "中性"),
+                     "has_edge": bool(ep.get("dir_has_edge", False)),
                      "target": ep["target_date"]})
     return rows
 
@@ -469,6 +471,7 @@ TEMPLATE = r"""
       <div class="big {{ 'up' if c.pct>=0 else 'down' }}">{{ c.mean }} <span style="font-size:15px">美元/桶</span></div>
       <div class="{{ 'up' if c.pct>=0 else 'down' }}" style="font-size:14px">
         {{ '▲' if c.pct>=0 else '▼' }} {{ c.pct }}%（相对观测日）</div>
+      <div class="kv"><span>方向立场</span><b>{{ c.stance }}{% if c.stance!='中性' %}（门控通过）{% elif not c.has_edge %}（未达显著门控）{% endif %}</b></div>
       <div class="kv"><span>95%概率区间</span><span>{{ c.range95 }}</span></div>
       <div class="kv"><span>看涨/看跌</span><span>{{ '%.0f'|format(c.prob_up) }}% / {{ '%.0f'|format(c.prob_down) }}%</span></div>
       <div class="probbar"><div class="u" style="width:{{c.prob_up}}%"></div><div class="d" style="width:{{c.prob_down}}%"></div></div>
@@ -619,11 +622,11 @@ TEMPLATE = r"""
      <div class="kv"><span>样本外原点数</span><b>{{ bt.n_origins }}</b></div>
      <div class="kv"><span>平均绝对误差 MAE（β校准后）</span><b>{{ bt.mae_pct }}%</b></div>
      <div class="kv"><span>均方根误差 RMSE</span><b>{{ bt.rmse_pct }}%</b></div>
-     <div class="kv"><span>方向命中率（全原点二分口径）</span><b>{{ (bt.direction_accuracy*100)|round(0) }}%</b></div>
-     {% if bt.engagement_rate is defined %}
-     <div class="kv"><span>明确表态占比（预测幅度≥中性带）</span><b>{{ (bt.engagement_rate*100)|round(0) }}%</b></div>
-     <div class="kv"><span>表态时方向命中率（可比 50%）</span><b>{{ (bt.engaged_direction_accuracy*100)|round(0) if bt.engaged_direction_accuracy is not none else '—' }}%</b></div>
-     {% endif %}
+     <div class="kv"><span>方向门控（样本外显著性）</span><b>{{ '通过（存在方向edge）' if bt.gate_has_edge else '未通过（以中性为主）' }}</b></div>
+     <div class="kv"><span>明确表态占比（看涨/看跌）</span><b>{{ (bt.stance_engagement_rate*100)|round(0) }}%</b></div>
+     <div class="kv"><span>中性占比（不计为错误）</span><b>{{ (bt.stance_neutral_rate*100)|round(0) }}%</b></div>
+     <div class="kv"><span>表态时方向命中（可比50%）</span><b>{{ (bt.stance_engaged_accuracy*100)|round(0) if bt.stance_engaged_accuracy is not none else '—' }}%{% if bt.stance_engaged_p is not none %}（p={{ bt.stance_engaged_p }}）{% endif %}</b></div>
+     <div class="kv"><span>方向概率 Brier（越低越好）</span><b>{{ bt.direction_brier }}</b></div>
      <div class="kv"><span>收益相关系数 IC</span><b>{{ bt.ic }}</b></div>
      <div class="kv"><span>随机游走基准 MAE</span><b>{{ bt.benchmark_mae_pct }}%</b></div>
      <div class="kv"><span>未校准原始模型 MAE</span><b>{{ bt.raw_mae_pct }}%（方向{{ (bt.raw_direction_accuracy*100)|round(0) }}%）</b></div>
@@ -631,7 +634,7 @@ TEMPLATE = r"""
      <div class="kv"><span>相对基准误差改善</span><b class="{{ 'up' if bt.mae_pct < bt.benchmark_mae_pct else 'down' }}">{{ bt.mae_improve_pct }}%</b></div>
      <div class="kv"><span>是否跑赢随机游走</span><b class="{{ 'up' if bt.mae_pct < bt.benchmark_mae_pct else 'down' }}">{{ '是' if bt.mae_pct < bt.benchmark_mae_pct else '否（已退守基准附近）' }}</b></div>
      <div class="kv"><span>当前样本外校准系数 β（{{ bt.horizon_td }}日）</span><b>{{ ml.calib_beta_h if ml.calib_beta_h is not none else '—' }}</b></div>
-     <p class="mut" style="margin-top:6px">β 由训练窗内部严格样本外检验估计、截断 [0,1]：模型近期无预测力时 β→0、点预测自动退守随机游走（机制上不跑输基准），出现真实趋势信号时 β 升高、按可信比例保留方向。β 很小时点预测≈持平（主动不表态），此时"全原点二分方向命中率"会把中性也计为错而系统性偏低，故另列"明确表态占比"与"表态时方向命中率"作为公允口径。日频 10 个交易日方向信噪比天然很低、长期围绕 50%，系统不通过过拟合/未来泄漏制造虚高命中率。</p>
+     <p class="mut" style="margin-top:6px">方向采用看涨/看跌/中性三分类：独立的涨跌概率分类器经多年、非重叠样本外原点做 isotonic 校准，只有高置信表态命中率显著高于 50%（二项检验达标、门控通过）才明确看涨/看跌，否则诚实判中性、中性不计为错误。幅度上 β 由训练窗内部严格样本外检验估计、截断[0,1]，无预测力时 β→0、点预测退守随机游走。全球定价的原油日频方向信噪比天然很低、长期围绕 50%，系统只在样本外显著处表态，不通过过拟合/未来泄漏制造虚高命中率。</p>
      {% else %}<p class="mut">{{ bt.reason }}</p>{% endif %}
    </div>
    <div class="card"><h3>历史预测 vs 已实现真实价（复测）</h3>

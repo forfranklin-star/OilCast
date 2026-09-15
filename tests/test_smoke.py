@@ -779,3 +779,80 @@ def test_build_features_survives_duplicate_trading_index():
                            events_available=False, views_available=True,
                            use_session_align=False)
     assert feats.index.is_unique and len(feats) == 60
+
+
+# ---------------- 方向概率分类 + 显著性门控（三分类，严格无泄漏）----------------
+def _direction_panel(predictable: bool, n: int = 1500, h: int = 5, seed: int = 1):
+    """构造方向【可预测】或【纯随机游走】的价格+特征面板（仅测试用）。
+
+    可预测：未来 h 日累计收益由当期可见信号 signal 的符号强决定（模拟真实 edge）；
+    随机游走：未来收益与 signal 独立（弱有效市场，不应被判出稳定 edge）。"""
+    rng = np.random.default_rng(seed)
+    idx = pd.bdate_range("2019-01-02", periods=n)
+    sig = rng.normal(size=n)
+    r = rng.normal(0, 0.004, n)
+    if predictable:
+        for t in range(n - h):
+            for k in range(1, h + 1):
+                r[t + k] += 0.006 * np.sign(sig[t])
+    price = pd.Series(70.0 * np.exp(np.cumsum(r)), index=idx)
+    X = pd.DataFrame({"signal": sig, "noise_a": rng.normal(size=n),
+                      "noise_b": rng.normal(size=n)}, index=idx)
+    return X, price
+
+
+def test_direction_gate_neutral_on_pure_random_walk():
+    # 纯随机游走：交叉拟合门控不得制造出"显著方向 edge"，最终立场应为中性
+    X, price = _direction_panel(predictable=False)
+    fc = ShortTermForecaster(horizon=5, compute_residuals=False,
+                             run_arima=False).fit(X, price)
+    gate5 = fc.dir_edge.get(5, {})
+    assert not gate5.get("has_edge", False), "随机游走不应通过方向显著性门控"
+    future = pd.bdate_range(X.index[-1] + pd.Timedelta(days=1), periods=5)
+    ep = fc.predict(X.iloc[[-1]], float(price.iloc[-1]), future).endpoint
+    assert ep["dir_stance"] == "中性"
+    assert set(["dir_stance", "dir_prob_up", "dir_has_edge"]).issubset(ep)
+
+
+def test_direction_gate_engages_when_edge_is_real():
+    # 存在真实可预测信号时：门控应识别 edge，且最终立场非中性（看涨或看跌）
+    X, price = _direction_panel(predictable=True)
+    fc = ShortTermForecaster(horizon=5, compute_residuals=False,
+                             run_arima=False).fit(X, price)
+    gate5 = fc.dir_edge.get(5, {})
+    assert gate5.get("has_edge") is True, f"真实edge应被门控识别: {gate5}"
+    assert gate5.get("engaged_hit", 0) >= 0.55
+    future = pd.bdate_range(X.index[-1] + pd.Timedelta(days=1), periods=5)
+    ep = fc.predict(X.iloc[[-1]], float(price.iloc[-1]), future).endpoint
+    assert ep["dir_stance"] in ("看涨", "看跌")
+
+
+def test_backtest_three_class_metrics():
+    # 三分类回测：字段齐全；明确表态率+中性率=1；中性不被计为方向错误
+    X, price = _direction_panel(predictable=True, n=1200)
+    bt = backtest_short(X, price, horizon=5, n_origins=12, gap=3,
+                        calib_origins=4, calib_iter=20, dir_origins=40)
+    assert bt["available"], bt
+    for k in ("stance_engagement_rate", "stance_neutral_rate", "stance_engaged_n",
+              "direction_brier", "clf_direction_accuracy", "gate_has_edge"):
+        assert k in bt
+    assert abs(bt["stance_engagement_rate"] + bt["stance_neutral_rate"] - 1.0) < 1e-9
+    assert bt["stance_engaged_n"] == round(bt["stance_engagement_rate"] * bt["n_origins"])
+
+
+def test_direction_layer_persists_across_pickle(tmp_path):
+    # 方向分类器/校准器/门控证据随工件整体持久化，导入后仍能给三分类立场（不从零）
+    import joblib
+    X, price = _direction_panel(predictable=True)
+    fc = ShortTermForecaster(horizon=5, compute_residuals=False,
+                             run_arima=False).fit(X, price)
+    assert fc.dir_models and fc.dir_edge
+    path = tmp_path / "fc.joblib"
+    joblib.dump(fc, path)
+    fc2 = joblib.load(path)
+    assert set(fc2.dir_models.keys()) == set(fc.dir_models.keys())
+    assert fc2.dir_edge == fc.dir_edge
+    future = pd.bdate_range(X.index[-1] + pd.Timedelta(days=1), periods=5)
+    ep1 = fc.predict(X.iloc[[-1]], float(price.iloc[-1]), future).endpoint
+    ep2 = fc2.predict(X.iloc[[-1]], float(price.iloc[-1]), future).endpoint
+    assert ep2["dir_stance"] == ep1["dir_stance"]

@@ -55,37 +55,42 @@ def review_predictions(prices: Dict[str, pd.Series], as_of: pd.Timestamp,
         covered = None
         if q05 is not None and q95 is not None and not pd.isna(q05) and not pd.isna(q95):
             covered = bool(q05 <= actual <= q95)
+        # 方向三分类：明确看涨/看跌才计方向对错，中性不计（弱有效市场下的诚实不表态）；
+        # 旧记录无 dir_stance 字段时回退到预测均值涨跌符号，保证历史复测不断档。
+        stance = r.get("dir_stance") if "dir_stance" in r.index else None
+        if stance in ("看涨", "看跌") and actual_ret != 0:
+            dir_hit = bool(actual_ret > 0) if stance == "看涨" else bool(actual_ret < 0)
+        elif stance is None and actual_ret != 0:
+            dir_hit = bool(np.sign(pred_ret) == np.sign(actual_ret))
+        else:
+            dir_hit = None   # 明确中性：不计方向对错
         rows.append({
             "report_date": r["report_date"], "target_date": target.strftime("%Y-%m-%d"),
             "horizon": r["horizon"], "instrument": inst,
             "base": round(p0, 2), "pred": round(float(mean), 2), "actual": round(actual, 2),
             "pred_ret_pct": round(pred_ret * 100, 2), "actual_ret_pct": round(actual_ret * 100, 2),
             "abs_err_pct": round(abs(float(mean) - actual) / actual * 100, 2),
-            "dir_hit": bool(np.sign(pred_ret) == np.sign(actual_ret)) if actual_ret != 0 else None,
+            "stance": stance, "dir_hit": dir_hit,
+            "is_neutral": bool(stance == "中性"),
             "covered": covered,
         })
     if not rows:
         return {"available": False, "reason": "历史预测的目标日尚无已实现真实价格，暂无可复盘样本"}
     d = pd.DataFrame(rows)
-    by_horizon: Dict[str, dict] = {}
-    for hz, g in d.groupby("horizon"):
+    def _summ(g) -> dict:
         cov = g["covered"].dropna().astype(float)
-        dh = g["dir_hit"].dropna().astype(float)   # astype(float)：避免 numpy.bool_ 与 None 混合时 object 列 mean 算错
-        by_horizon[hz] = {
+        dh = g["dir_hit"].dropna().astype(float)   # 只含明确表态（中性已置 None）
+        n_neutral = int(g["is_neutral"].sum())
+        return {
             "n": int(len(g)),
+            "engaged_n": int(len(dh)),
+            "neutral_n": n_neutral,
             "mae_pct": round(float(g["abs_err_pct"].mean()), 2),
             "dir_acc": round(float(dh.mean()) * 100, 1) if len(dh) else None,
             "coverage95": round(float(cov.mean()) * 100, 1) if len(cov) else None,
         }
-    overall_dir = d["dir_hit"].dropna().astype(float)
-    overall_cov = d["covered"].dropna().astype(float)
-    summary = {
-        "n": int(len(d)),
-        "mae_pct": round(float(d["abs_err_pct"].mean()), 2),
-        "dir_acc": round(float(overall_dir.mean()) * 100, 1) if len(overall_dir) else None,
-        "coverage95": round(float(overall_cov.mean()) * 100, 1) if len(overall_cov) else None,
-        "by_horizon": by_horizon,
-    }
+    by_horizon: Dict[str, dict] = {hz: _summ(g) for hz, g in d.groupby("horizon")}
+    summary = {**_summ(d), "by_horizon": by_horizon}
     detail = d.sort_values(["report_date", "target_date"], ascending=False).head(max_rows)
     detail = detail.sort_values("report_date")
     return {"available": True, "summary": summary, "detail": detail.to_dict("records")}

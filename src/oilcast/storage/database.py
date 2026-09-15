@@ -40,7 +40,7 @@ CREATE TABLE IF NOT EXISTS institutional_views (
 CREATE TABLE IF NOT EXISTS forecasts (
     report_date TEXT, horizon TEXT, instrument TEXT, target_date TEXT,
     mean REAL, q05 REAL, q25 REAL, q50 REAL, q75 REAL, q95 REAL,
-    prob_up REAL, prob_down REAL);
+    prob_up REAL, prob_down REAL, dir_stance TEXT);
 CREATE TABLE IF NOT EXISTS factor_weights (
     report_date TEXT, instrument TEXT, factor TEXT, weight REAL, model_importance REAL,
     prior REAL, available INTEGER, PRIMARY KEY(report_date, instrument, factor));
@@ -69,7 +69,8 @@ class OilCastDB:
     def _migrate_add_columns(con) -> None:
         """旧宽表补新增列（不涉及主键，ADD COLUMN 即可）。"""
         add = {"raw_prices": [("shanghai_crude", "REAL")],
-               "raw_macro": [("usdcny", "REAL"), ("usdjpy", "REAL")]}
+               "raw_macro": [("usdcny", "REAL"), ("usdjpy", "REAL")],
+               "forecasts": [("dir_stance", "TEXT")]}
         for table, cols in add.items():
             existing = {r[1] for r in con.execute(f"PRAGMA table_info({table})")}
             for name, typ in cols:
@@ -212,10 +213,11 @@ class OilCastDB:
         with self._conn() as con:
             con.execute("DELETE FROM forecasts WHERE report_date=?", (report_date,))
             con.executemany(
-                "INSERT INTO forecasts VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO forecasts VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 [(report_date, r["horizon"], r["instrument"], r["target_date"],
                   r["mean"], r["q05"], r["q25"], r["q50"], r["q75"], r["q95"],
-                  r.get("prob_up"), r.get("prob_down")) for r in records])
+                  r.get("prob_up"), r.get("prob_down"), r.get("dir_stance"))
+                 for r in records])
 
     def save_weights(self, report_date: str, weights: pd.DataFrame,
                      instrument: str = "wti") -> None:

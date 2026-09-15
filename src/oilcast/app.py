@@ -177,6 +177,13 @@ for col, hz in zip(cols, ("short", "mid", "long")):
         ep = item["endpoint"]
         st.caption(f"截至 {ep['target_date']}（观测日 {item.get('observed_date','—')}）")
         st.metric(f"预测均值（{_sel_unit}）", f"{ep['mean']:.2f}", delta=f"{ep['pct_mean']:+.2f}%")
+        stance = ep.get("dir_stance", "中性")
+        edge_note = ""
+        if ep.get("dir_has_edge") and ep.get("dir_edge_hit") is not None:
+            edge_note = f"｜样本外表态命中 {ep['dir_edge_hit']*100:.0f}%"
+        elif stance == "中性":
+            edge_note = "｜方向未达显著门控，以区间为准"
+        st.markdown(f"方向立场：**{stance}**{edge_note}")
         st.markdown(f"95%区间 **{ep['q05']} ~ {ep['q95']}**　"
                     f"看涨 {ep['prob_up']*100:.0f}% / 看跌 {ep['prob_down']*100:.0f}%")
         st.progress(float(ep["prob_up"]), text=f"看涨概率 {ep['prob_up']*100:.0f}%")
@@ -296,20 +303,23 @@ if ml:
         bt = ml.get("backtest", {})
         if bt.get("available"):
             b1, b2, b3, b4, b5 = st.columns(5)
-            b1.metric("MAE(β校准)", f"{bt['mae_pct']}%", f"基准 {bt['benchmark_mae_pct']}%")
-            b2.metric("未校准MAE", f"{bt.get('raw_mae_pct', bt['mae_pct'])}%")
-            eng = bt.get("engaged_direction_accuracy")
+            b1.metric("MAE", f"{bt['mae_pct']}%", f"随机游走 {bt['benchmark_mae_pct']}%")
+            b2.metric("收益相关IC", f"{bt.get('ic', 0):.2f}")
+            eng = bt.get("stance_engaged_accuracy")
+            gate = "门控通过" if bt.get("gate_has_edge") else "门控未过/中性为主"
             b3.metric("表态时方向命中",
                       (f"{eng*100:.0f}%" if eng is not None else "—"),
-                      f"表态占比 {bt.get('engagement_rate', 0)*100:.0f}%｜全原点 {bt['direction_accuracy']*100:.0f}%")
-            b4.metric("收益相关IC", f"{bt.get('ic', 0):.2f}")
-            b5.metric("当前β(置信度)", f"{ml.get('calib_beta_h', '—')}")
+                      f"p={bt.get('stance_engaged_p', '—')}")
+            b4.metric("明确表态占比", f"{bt.get('stance_engagement_rate', 0)*100:.0f}%",
+                      f"中性 {bt.get('stance_neutral_rate', 0)*100:.0f}%｜{gate}")
+            b5.metric("概率Brier", f"{bt.get('direction_brier', '—')}")
             st.caption(
                 f"{bt.get('window_start','')}~{bt.get('window_end','')} 共 {bt['n_origins']} 个样本外原点；"
-                + (f"β 校准后跑赢随机游走，MAE 较基准降低 {bt.get('mae_improve_pct', 0)}%（未校准原始模型 "
-                   f"{bt.get('raw_mae_pct','—')}%）；β 趋近 0 表示近期样本外无方向优势、模型自动退守随机游走，不硬赌方向。"
+                "方向为看涨/看跌/中性三分类，中性是弱有效市场下的诚实选择、不计为错误，"
+                "仅当样本外表态命中显著高于 50%（门控通过）才明确表态；"
+                + (f"幅度 MAE 较随机游走降低 {bt.get('mae_improve_pct', 0)}%。"
                    if bt["mae_pct"] < bt["benchmark_mae_pct"]
-                   else "β 校准后已退守随机游走基准附近，继续积累样本；日频 10 日方向围绕 50% 属正常。"))
+                   else "幅度预测在随机游走基准附近，价值主要体现在区间刻画；日频方向围绕 50% 属正常。"))
         else:
             st.caption(bt.get("reason", "真实样本积累中，回测暂不可用"))
     with c2:
