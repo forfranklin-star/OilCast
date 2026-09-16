@@ -1,0 +1,260 @@
+# =====================================================================
+# 多因素油价智能分析与预测系统 —— 全局配置
+# 所有模块只从此文件读取可调参数，避免在代码里写死魔法数字。
+# =====================================================================
+
+system:
+  # 基准时区：报告日期按北京时间（UTC+8）落盘，cron 设定为 UTC 02:00
+  report_timezone: "Asia/Shanghai"
+  random_seed: 42
+  # 网络请求通用设置（遵守 robots.txt、慢速抓取）
+  request:
+    timeout_sec: 10
+    retry: 2                    # 主源偶发抖动时多试 2 次，最大化拿到最新交易日收盘的概率
+    sleep_between_requests_sec: 1.0
+    # 可识别的学术研究 UA（避免使用 "bot" 字样：部分政府/财经站点会直接丢弃该类请求）
+    user_agent: "Mozilla/5.0 (compatible; OilCastResearch/1.0; academic; +https://github.com/your-name/oilcast)"
+
+# ------------------------- 数据原则（最高优先级）----------------------
+# 只允许真实、可追溯、带观测日期的数据；任何缺失/过期/无法验证的数据一律保持
+#   缺失，禁止插值外推、禁止用合成值补齐；数据不足以建模时对应预测显式标注
+#   unavailable，而不是输出假数字。系统不含任何演示/合成数据入口。
+data_sources:
+  mode: "strict"
+  # EIA 官方 API（可选）：https://www.eia.gov/opendata/ 注册后填入环境变量 EIA_API_KEY
+  eia_api_key_env: "EIA_API_KEY"
+  # FRED（美联储圣路易斯分行）无需 key 的 CSV 端点
+  fred_base_csv: "https://fred.stlouisfed.org/graph/fredgraph.csv"
+  # 真实序列映射（FRED series id；口径与观测日期均可在 FRED 官网核验）
+  fred_series_map:
+    wti: "DCOILWTICO"        # Cushing OK WTI 现货，美元/桶（EIA 原始，FRED 转发，工作日日频）
+    brent: "DCOILBRENTEU"    # 欧洲 Brent 现货，美元/桶（工作日日频）
+    us10y: "DGS10"           # 10Y 国债收益率（工作日日频）
+    us2y: "DGS2"
+    dxy: "DTWEXBGS"          # 名义广义美元指数（工作日日频，DXY 的官方口径替代）
+    cpi_level: "CPIAUCSL"    # CPI（月频）
+    payems: "PAYEMS"         # 非农就业（月频）
+    fedfunds: "FEDFUNDS"     # 联邦基金利率（月频）
+    demand_proxy: "INDPRO"   # 工业生产指数（月频，同比作为真实需求景气代理）
+  # yfinance 作为期货价格的备份信源（CL=F / BZ=F / DX-Y.NYB），与 FRED 交叉印证
+  yfinance_backup: true
+  # Yahoo 原生 chart API（不依赖 yfinance 库，海外 GitHub Actions 可达）
+  yahoo_chart: "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+  # Google News RSS（无需 key），用于地缘事件挖掘；不可达时自动尝试后续源
+  google_news_rss: "https://news.google.com/rss/search"
+  bing_news_rss: "https://www.bing.com/news/search"
+  # 美国财政部官方收益率曲线 CSV（FRED 利率的官方备源，无 key）
+  treasury_yield_csv: "https://home.treasury.gov/resource-center/data-chart-center/interest-rates/daily-treasury-rates.csv/{year}/all?type=daily_treasury_yield_curve&field_tdr_date_value={year}&page&_format=csv"
+  # 日频地缘风险指数（Caldara & Iacoviello）：两个地址按序尝试，均不可达则用
+  # 【真实新闻计数代理】（由真实 RSS 事件衍生，口径会在谱系中标注）
+  gprd_urls:
+    - "https://www.matteoiacoviello.com/research_files/gprd_web_current.csv"
+    - "https://www.matteoiacoviello.com/gpr_files/data_gpr_export.xls"
+  gprd_url: "https://www.matteoiacoviello.com/research_files/gprd_web_current.csv"  # 向后兼容
+  # ------------------------------------------------------------------
+  # 多数据源优先级链：每个字段按 providers 顺序依次尝试，第一个返回足量
+  # 真实观测的源被采用；每次尝试（含失败原因/耗时）都写入数据谱系，全程可审计。
+  # 全部失败才标记 unavailable，绝不造数。海外可达性标注：
+  #   world=全球稳定可达；us=海外（含 GitHub Actions）可达，个别地区网络可能受限。
+  # ------------------------------------------------------------------
+  source_chains:
+    # 价格链采用"新鲜度优先"(select=freshest)：尝试全部源后选末次观测最新者，
+    # 现货官方发布滞后时由更新鲜的近月期货顶上；只整条采用单一源、不混合口径。
+    wti:
+      - {name: "CNBC:@CL.1近月期货",     kind: cnbc,   reach: world, ref: "@CL.1", caliber: "近月连续期货"}
+      - {name: "FRED:DCOILWTICO现货",    kind: fred,   reach: world, ref: DCOILWTICO, caliber: "EIA现货"}
+      - {name: "EIA:RWTC(需EIA_API_KEY)", kind: eia,    reach: world, ref: "PET.RWTC.D", caliber: "EIA现货"}
+      - {name: "Yahoo:CL=F",             kind: yahoo,  reach: us,    ref: "CL=F", caliber: "近月连续期货"}
+      - {name: "yfinance:CL=F",          kind: yfinance, reach: us,  ref: "CL=F", caliber: "近月连续期货"}
+    brent:
+      - {name: "CNBC:@LCO.1近月期货",    kind: cnbc,   reach: world, ref: "@LCO.1", caliber: "近月连续期货"}
+      - {name: "FRED:DCOILBRENTEU现货",  kind: fred,   reach: world, ref: DCOILBRENTEU, caliber: "EIA现货"}
+      - {name: "EIA:RBRTE(需EIA_API_KEY)", kind: eia,  reach: world, ref: "PET.RBRTE.D", caliber: "EIA现货"}
+      - {name: "Yahoo:BZ=F",             kind: yahoo,  reach: us,    ref: "BZ=F", caliber: "近月连续期货"}
+      - {name: "yfinance:BZ=F",          kind: yfinance, reach: us,  ref: "BZ=F", caliber: "近月连续期货"}
+    # 上海原油 INE SC 主力连续（人民币/桶，亚太/中东到岸价）：新浪主源、东财备源
+    shanghai_crude:
+      - {name: "新浪:INE SC0主力连续",   kind: sina_inner,      reach: world, ref: SC0, caliber: "INE上海原油主力连续(人民币/桶)"}
+      - {name: "东财:INE sc0主力连续",   kind: eastmoney_inner, reach: world, ref: "113.sc0", caliber: "INE上海原油主力连续(人民币/桶)"}
+    # 美燃油 = NYMEX 超低硫柴油/取暖油（ULSD Heating Oil，代码 HO，报价 美元/加仑）
+    heating_oil:
+      - {name: "CNBC:@HO.1近月期货",     kind: cnbc,   reach: world, ref: "@HO.1", caliber: "近月连续期货·NYMEX ULSD取暖油(美元/加仑)"}
+      - {name: "Yahoo:HO=F",             kind: yahoo,  reach: us,    ref: "HO=F", caliber: "近月连续期货·NYMEX ULSD(美元/加仑)"}
+      - {name: "yfinance:HO=F",          kind: yfinance, reach: us,  ref: "HO=F", caliber: "近月连续期货·NYMEX ULSD(美元/加仑)"}
+    # 伦敦柴油 = ICE Gasoil（代码 G，报价 美元/吨）；替代无法核验的国内0#柴油
+    gasoil:
+      - {name: "CNBC:@GAS.1近月期货",    kind: cnbc,   reach: world, ref: "@GAS.1", caliber: "近月连续期货·ICE Gasoil伦敦柴油(美元/吨)"}
+    us10y:
+      - {name: "FRED:DGS10",             kind: fred,    reach: world, ref: DGS10}
+      - {name: "USTreasury:10Y",         kind: treasury, reach: world, ref: "10 Yr"}
+    us2y:
+      - {name: "FRED:DGS2",              kind: fred,    reach: world, ref: DGS2}
+      - {name: "USTreasury:2Y",          kind: treasury, reach: world, ref: "2 Yr"}
+    dxy:
+      - {name: "FRED:DTWEXBGS",          kind: fred,    reach: world, ref: DTWEXBGS}
+      - {name: "Yahoo:DX-Y.NYB",         kind: yahoo,   reach: us, ref: "DX-Y.NYB"}
+    # 美元兑人民币（用于把上海原油由人民币/桶换算为美元/桶，进而与布伦特算升贴水）
+    # ECB 参考汇率每日更新、海外稳定可达优先；FRED 在岸定盘常滞后作为兜底；Yahoo 末位
+    usdcny:
+      - {name: "ECB:Frankfurter参考汇率",  kind: ecb,    reach: world, ref: CNY, caliber: "人民币/美元(CNY per USD, ECB参考汇率)"}
+      - {name: "FRED:DEXCHUS",           kind: fred,    reach: world, ref: DEXCHUS, caliber: "人民币/美元(CNY per USD)"}
+      - {name: "Yahoo:CNY=X",            kind: yahoo,   reach: us, ref: "CNY=X", caliber: "人民币/美元"}
+    # 美元兑日元（作为各油种敏感度不同的外生宏观变量之一）
+    usdjpy:
+      - {name: "ECB:Frankfurter参考汇率",  kind: ecb,    reach: world, ref: JPY, caliber: "日元/美元(JPY per USD, ECB参考汇率)"}
+      - {name: "FRED:DEXJPUS",           kind: fred,    reach: world, ref: DEXJPUS, caliber: "日元/美元(JPY per USD)"}
+      - {name: "Yahoo:JPY=X",            kind: yahoo,   reach: us, ref: "JPY=X", caliber: "日元/美元"}
+  # 事件/机构观点 RSS 源（按序累积去重，直到拿满条数或源用尽；全部失败才留空）
+  # OilPrice 为能源垂直专业源（全球可达、相关度最高），其余为综合财经/搜索源。
+  news_rss_feeds:
+    - {name: "OilPrice",  kind: rss_feed, reach: world,
+       url: "https://oilprice.com/rss/main", energy_focus: true}
+    - {name: "GoogleNews", kind: google,  reach: us}
+    - {name: "BingNews",   kind: bing,    reach: us}
+    - {name: "WSJMarkets", kind: rss_feed, reach: world,
+       url: "https://feeds.content.dowjones.io/public/rss/RSSMarketsMain"}
+    - {name: "MarketWatch", kind: rss_feed, reach: world,
+       url: "https://www.marketwatch.com/rss/topstories"}
+  news_keywords:
+    - "OPEC oil production"
+    - "Russia oil sanctions"
+    - "Red Sea shipping attack"
+    - "Iran oil"
+    - "oil price forecast"
+    - "crude oil supply disruption"
+
+# ------------------------- 数据质量门 ---------------------------------
+# 只有通过质量门的真实字段才允许进入模型；状态：ok / stale（过期）/
+# insufficient（样本不足）/ unavailable（源不可达或无此观测）
+quality_gate:
+  price_daily:
+    min_obs: 120            # 最少真实观测数（工作日）
+    max_stale_bdays: 7      # 最后观测距报告日超过 7 个工作日 → stale
+  macro_daily:
+    min_obs: 120
+    max_stale_bdays: 10
+    ffill_limit_bdays: 3    # 日频仅允许填补节假日级短缺口（≤3 工作日），超出保持缺失
+  macro_monthly:
+    max_stale_days: 60      # 月频指标发布滞后容忍度（天）
+  events:
+    lookback_days: 30
+
+# ------------------------- 价格标的 -----------------------------------
+instruments:
+  wti:
+    yf_ticker: "CL=F"
+    fred_id: "DCOILWTICO"
+    display: "WTI原油"
+    unit: "美元/桶"
+  brent:
+    yf_ticker: "BZ=F"
+    fred_id: "DCOILBRENTEU"
+    display: "布伦特原油"
+    unit: "美元/桶"
+  shanghai_crude:
+    display: "上海原油 INE SC"
+    unit: "元/桶"
+  # 国内0#柴油无海外可核验真实源，已取消；以两个可完整取数的成品油期货替代
+  heating_oil:
+    yf_ticker: "HO=F"
+    display: "美燃油·NYMEX超低硫柴油(HO)"
+    unit: "美元/加仑"
+  gasoil:
+    display: "伦敦柴油·ICE Gasoil"
+    unit: "美元/吨"
+
+# ------------------------- 训练 / 预测参数 -----------------------------
+model:
+  history_days: 3650        # 抓取历史长度（自然日，约 10 年；CNBC 日K实测可回溯25年，
+                            # 需要更长可上调，如 5475≈15年、9125≈25年，模型会自动用满）
+  rolling_window: 180       # 残差滚动原点的最小回看锚点（交易日）
+  # 短期 direct 模型【滚动训练窗】（交易日）。严格无泄漏 walk-forward（训练只用标签终点
+  # ≤原点 t 的样本，绝不偷看 t 之后价格）表明：金融变量关系非平稳，用满 10 年历史会被过时
+  # regime 稀释；500 日（约 2 年）滚动窗在幅度误差 MAE 上最稳。注意：日度【方向】命中在
+  # WTI/Brent 上即便用 500 窗也仅约 50%（弱有效市场常态）；早期注释里"方向 70%~80%"来自
+  # 训练标签越过原点的【泄漏】，已废弃——真实但微弱的方向 edge 只在特定品种/周期出现，
+  # 由下方"方向概率分类 + 显著性门控"在被无泄漏回测证实时才启用。
+  train_window: 500
+  max_train_rows: 0         # 额外硬上限：0=不额外截断（以 train_window 滚动窗为准）；
+                            # 设正整数时在滚动窗基础上再限制最多 N 行（一般保持 0）
+  point_shrink: 0.9         # 点预测向随机游走(涨跌=0)的收缩系数：回测显示原写死 0.7 过度
+                            # 收缩、损害 MAE；0.9 在幅度与稳健间更优（方向命中与该系数无关）
+  direct_max_iter: 300      # 每个 direct 步长模型在滚动窗内的梯度提升迭代数
+  # 样本外在线校准（β 门控）：在训练窗内部做滚动原点检验，用 pred/actual 估最优线性收缩
+  # β=Cov/Var（截断[0,1]、带样本量收缩）。无样本外预测力时 β→0、点预测退守随机游走，
+  # 机制上保证长期不跑输随机游走；有真实趋势信号时 β>0 按可信比例保留方向。
+  calib_origins: 30         # 内部校准/残差滚动原点个数
+  calib_gap: 6              # 内部原点间隔交易日
+  calib_iter: 120           # 内部校准用模型的迭代数（控制每日任务耗时）
+  calib_prior_n: 20         # β 的样本量收缩先验（越大越保守、越偏向 0）
+  use_regime_beta: false    # 是否按高/低波动 regime 分两档估 β。2026-09 三品种无泄漏 A/B
+                            # 证实分层后 MAE 均轻微劣于单一全局 β（校准原点少、二分后样本
+                            # 不足），故默认关闭；保留开关待校准样本显著增多后再验证
+  backtest_origins: 40      # 样本外回测滚动原点个数（越多统计越可信，每日任务耗时随之增加）
+  backtest_gap: 5           # 回测相邻原点间隔交易日（40×5≈覆盖最近约 9~10 个月）
+  resid_train_window: 500   # 每个滚动残差原点回看多少交易日做样本外检验（与训练窗同口径）
+  # —— 方向概率分类 + 显著性门控（2026-09 严格无泄漏 walk-forward 结论）——
+  # 方向与幅度解耦：单独训练"未来 h 日涨/跌"概率分类器，用滚动原点【样本外】预测做
+  # isotonic 概率校准；只有当某(品种,h)的样本外高置信表态命中率显著高于 50% 时，才允许
+  # 明确看涨/看跌，否则方向判为"中性"（无统计 edge 时诚实不表态，而非被 β 压平后又把中性
+  # 计成方向错误）。无泄漏证据：WTI/Brent 日度方向不显著→多为中性；上海原油 5 日、尤其
+  # 高波动期/高置信档命中约 0.6~0.77→满足门控时才表态。
+  dir_clf_max_iter: 120     # 最终部署方向分类器的梯度提升迭代数
+  dir_gate_max_iter: 60     # 门控滚动在数百原点上反复拟合、只判 edge 是否存在，用较少迭代提速
+  dir_gate_lookback: 1200   # 方向门控回看交易日（约5年）；每步长按h非重叠取原点，长历史
+                            # 才能稳定判定方向edge（短窗噪声大、结论会在品种间偶然翻转）
+  dir_gate_max_origins_per_h: 150  # 每个周期门控原点上限：步长取h整数倍抽稀、标签仍非重叠，控耗时
+  dir_gate_refresh_days: 7  # 门控edge跨期复用天数：该自然日内每日只重训最终分类器、复用门控证据，
+                            # 到期/冷启动/特征schema变化才全量重算（edge是慢变统计，避免每日重跑数百模型）
+  dir_conf_threshold: 0.62  # 校准后 P(涨)≥该值才明确看涨，≤1-该值(0.38)看跌，其间为中性
+  edge_min_n: 20            # 判定方向 edge 所需的最小样本外原点总数
+  edge_min_engaged: 8       # 其中高置信表态原点的最少个数
+  edge_min_hit: 0.55        # 高置信表态原点的方向命中率下限（须高于 50%）
+  edge_max_p: 0.20          # 表态命中率相对抛硬币(50%)的二项检验 p 值上限（越小越严格）
+  # 判据二·经济价值：趋势跟随常"胜率不高但盈亏比>1、期望收益为正"，单看胜率会误杀。
+  # 表态子集按立场持有的对数收益须同时满足：平均收益>0、盈亏比≥下限、t检验p≤上限。
+  edge_min_payoff: 1.15     # 表态子集盈亏比(平均盈利/平均亏损)下限
+  edge_max_ret_p: 0.10      # 表态子集平均收益相对 0 的单样本 t 检验 p 上限
+  short_horizon_td: 10      # 两周 ≈ 10 个交易日
+  mid_horizon_td: 66        # 三个月 ≈ 66 个交易日
+  long_horizon_td: 252      # 长期：12 个月 ≈ 252 个交易日
+  ci_levels: [0.50, 0.80, 0.95]   # 概率区间
+  n_monte_carlo: 2000       # 长期蒙特卡洛路径数
+  min_train_obs: 250        # 训练模型所需的最少真实样本，不足则该模型 unavailable
+  # 权重自适应：新拟合权重与历史权重做指数平滑（越大越依赖历史，越稳）
+  weight_ema_alpha: 0.6
+  # 模型权重相对人工先验的收缩系数（1=完全相信模型，0=完全用先验）
+  prior_shrinkage: 0.7
+  # --- 模型持续学习（跨进程重启不从零）---
+  persist_models: true          # 每期训练后保存模型工件，下期加载热启动
+  warm_start: true              # 梯度提升在上期模型基础上增量加树（特征列一致时）
+  max_cum_iter: 900             # 单模型累计最大迭代，超过则冷启动重建，防止树无限增长
+  residual_ema_alpha: 0.7       # 残差分位/波动与上期融合：越大越偏重本期，越小越依赖历史
+
+# 人工先验权重（仅对【有真实数据】的因素归一化；缺失因素不参与、不填零冒充）
+prior_weights:
+  supply_disruption: 0.19
+  geopolitical_risk: 0.17
+  usd_index: 0.13
+  us_treasury_10y: 0.08
+  cpi_surprise: 0.10
+  jobs_surprise: 0.06
+  fed_policy_expectation: 0.10
+  fx_jpy: 0.04              # 日元汇率：各油种敏感度不同，先验给小权重、主要靠数据学
+  demand_outlook: 0.07
+  institutional_view: 0.06
+
+# 长期情景假设（相对当前均衡价的年化漂移与波动，用于情景 + 蒙特卡洛）
+scenarios:
+  bull:   {label: "高油价（供给冲击）", prob_prior: 0.25, drift_annual: 0.18, vol_annual: 0.34}
+  base:   {label: "基准（供需再平衡）", prob_prior: 0.50, drift_annual: 0.02, vol_annual: 0.28}
+  bear:   {label: "低油价（需求衰退）", prob_prior: 0.25, drift_annual: -0.15, vol_annual: 0.32}
+
+# ------------------------- 存储 ---------------------------------------
+storage:
+  sqlite_path: "data/oilcast.db"
+  raw_dir: "data/raw"
+  processed_dir: "data/processed"
+  archive_dir: "reports/archive"
+  latest_dir: "reports/latest"
+  model_dir: "models/artifacts"   # 跨期模型工件（热启动持续学习，可导入导出）
