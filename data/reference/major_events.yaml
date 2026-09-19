@@ -1,0 +1,354 @@
+# ============================================================================
+# OilCast 重大油价事件年表（2016-09 至今，与价格数据时间范围匹配）
+# ----------------------------------------------------------------------------
+# 用途：把公开、可核验、带观测日期的重大事件转成日频"事件状态"特征，供模型在
+#       十年样本上学习各油种对地缘冲突 / 供给政策 / 实物中断 / 需求冲击的敏感度，
+#       尤其让上海 INE 原油能在多次"对华中东供油链路"事件上学到真实敏感度。
+#
+# 铁律（与全项目一致）：
+#   - 只收录公开、多源可核验、日期明确的重大事件；无法核实起止日期的一律不写。
+#   - 第 t 行只反映"截至 t 事件是否正在发生"，无未来函数；滚动重训使权重随局势变化。
+#   - 这是人工核验的历史年表（reference），不是新闻抓取，也绝不用于"补齐"缺失行情。
+#
+# 字段：
+#   name         事件名
+#   start/end    影响窗口起止（YYYY-MM-DD；end=null 表示持续至今）。脉冲事件给约
+#                30 自然日窗口以覆盖冲击与消化；长期危机给实际起止。
+#   intensity    0~1 的市场冲击强度（按供应中断规模 / 价格跳空 / 持续期标定，见 note）
+#   category     geopolitical   地缘冲突、制裁、袭船、设施遇袭
+#                supply_policy  OPEC+/SPR 等人为产量与储备政策
+#                supply_outage  非地缘实物中断（寒潮、飓风、运河搁浅）
+#                demand_shock   需求侧（疫情、金融危机）
+#   china_supply true=直接扰动对华/经霍尔木兹的中东原油链路（伊朗制裁、海湾油轮战、
+#                阿美遇袭、霍尔木兹封锁等）；用于上海 INE 特异敏感度。
+#   source       可核验来源 URL（通讯社 / 官方 / 权威媒体 / 官方年表）
+#   note         事实与口径说明
+#   phases       事件内部升级/缓和子区间（在 base intensity 之上取 max）
+# ============================================================================
+
+events:
+
+  # ---- 2016 ----------------------------------------------------------------
+  - name: "OPEC 阿尔及尔会议达成八年来首次限产协议"
+    start: "2016-09-28"
+    end: "2016-10-28"
+    intensity: 0.5
+    category: supply_policy
+    china_supply: false
+    source: "https://www.shfe.com.cn/upload/20170508/1494226997785.pdf"
+    note: "上期所《2016石油市场回顾及大事记》：9月28日OPEC宣布8年来首度限制产出（3250-3300万桶/日），当日ICE Brent涨5.91%。"
+
+  - name: "OPEC 维也纳减产约120万桶/日，OPEC+机制成形"
+    start: "2016-11-30"
+    end: "2016-12-30"
+    intensity: 0.5
+    category: supply_policy
+    china_supply: false
+    source: "https://tass.com/economy/1882509"
+    note: "11月30日OPEC维也纳会议减产约120万桶/日，12月10日俄罗斯等11个非OPEC国加入，OPEC+联盟成形。"
+
+  # ---- 2017 ----------------------------------------------------------------
+  - name: "OPEC+ 延长减产至2018年一季度"
+    start: "2017-05-25"
+    end: "2017-06-25"
+    intensity: 0.3
+    category: supply_policy
+    china_supply: false
+    source: "https://aitimeline.in/opec-plus-production-cuts-history-timeline-10087/"
+    note: "5月25日OPEC+部长级会议决定将2016年底减产协议延长9个月至2018年3月。"
+
+  - name: "OPEC+ 再度延长减产至2018年底"
+    start: "2017-11-30"
+    end: "2017-12-30"
+    intensity: 0.35
+    category: supply_policy
+    china_supply: false
+    source: "https://aitimeline.in/opec-plus-production-cuts-history-timeline-10087/"
+    note: "11月30日OPEC+决定将减产延长至2018年底，俄罗斯与沙特牵头。"
+
+  # ---- 2018 ----------------------------------------------------------------
+  - name: "美国退出伊朗核协议（JCPOA），重启对伊制裁"
+    start: "2018-05-08"
+    end: "2018-06-08"
+    intensity: 0.6
+    category: geopolitical
+    china_supply: true
+    source: "https://energyriskiq.com/research/global-energy-risk-timeline"
+    note: "5月8日美国宣布退出JCPOA并将重启对伊制裁，逆转2015年协议后伊朗出口回升，重新抬升中东风险溢价；中国为伊朗原油主要买家。"
+
+  - name: "OPEC+ 决定适度增产"
+    start: "2018-06-22"
+    end: "2018-07-22"
+    intensity: 0.35
+    category: supply_policy
+    china_supply: false
+    source: "https://aitimeline.in/opec-plus-production-cuts-history-timeline-10087/"
+    note: "6月22日OPEC+维也纳会议决定自7月起名义增产约100万桶/日，以弥补委内瑞拉/伊朗潜在缺口。"
+
+  - name: "美国对伊朗能源制裁重启（含临时豁免）"
+    start: "2018-11-05"
+    end: "2018-12-05"
+    intensity: 0.6
+    category: geopolitical
+    china_supply: true
+    source: "http://m.toutiao.com/group/6639501334049456644/"
+    note: "11月5日美国对伊朗能源制裁重启，给予8个经济体（含中国）半年期临时豁免；伊朗出口预期大幅下降。"
+
+  - name: "OPEC+ 维也纳减产120万桶/日"
+    start: "2018-12-07"
+    end: "2019-01-07"
+    intensity: 0.5
+    category: supply_policy
+    china_supply: false
+    source: "http://m.toutiao.com/group/6639501334049456644/"
+    note: "12月7日OPEC+宣布合计减产120万桶/日（OPEC 80万、非OPEC 40万），2019年1月起执行。"
+
+  # ---- 2019 ----------------------------------------------------------------
+  - name: "美国取消全部伊朗制裁豁免，极限施压"
+    start: "2019-04-22"
+    end: "2019-05-22"
+    intensity: 0.6
+    category: geopolitical
+    china_supply: true
+    source: "https://energyriskiq.com/research/global-energy-risk-timeline"
+    note: "4月22日美国宣布5月2日起取消所有伊朗原油进口豁免，伊朗出口由约250万桶/日降至约50万桶/日，霍尔木兹风险溢价抬升。"
+
+  - name: "海湾油轮战：阿曼湾袭船与伊朗击落美军无人机"
+    start: "2019-05-12"
+    end: "2019-07-31"
+    intensity: 0.4
+    category: geopolitical
+    china_supply: true
+    source: "https://m.21jingji.com/article/20190621/herald/587a2b159a749458ac9e859fd8e6ae5f_zaker.html"
+    note: "5月12日、6月13日阿曼湾两艘油轮遇袭；6月20日伊朗在霍尔木兹海峡上空击落美军MQ-4C无人机，当日WTI盘中涨约6%；7月英伊互扣油轮。"
+    phases:
+      - {start: "2019-06-13", end: "2019-06-24", intensity: 0.6, note: "第二艘油轮遇袭+无人机被击落，冲突高点"}
+
+  - name: "沙特阿美 Abqaiq/Khurais 设施遇袭（史上最大单日供应中断）"
+    start: "2019-09-14"
+    end: "2019-10-04"
+    intensity: 0.9
+    category: geopolitical
+    china_supply: true
+    source: "http://paper.ce.cn/jjrb/page/1/2019-09/19/12/2019091912_pdf.pdf"
+    note: "9月14日无人机/导弹袭击沙特阿美布盖格炼厂与胡赖斯油田，中断约570万桶/日（约沙特产能一半、全球5%）；9月16日Brent一度涨约19%，为1991年海湾战争以来最大单日跳空。"
+
+  - name: "OPEC+ 在2018减产基础上深化减产50万桶/日"
+    start: "2019-12-06"
+    end: "2020-01-06"
+    intensity: 0.4
+    category: supply_policy
+    china_supply: false
+    source: "https://www.eia.gov/todayinEnergy/detail.php?id=42415"
+    note: "12月6日OPEC+宣布在2018年减产基础上再额外减产50万桶/日（沙特自愿超额）。"
+
+  # ---- 2020 ----------------------------------------------------------------
+  - name: "新冠疫情全球需求崩塌（含4月负油价）"
+    start: "2020-01-30"
+    end: "2020-06-30"
+    intensity: 1.0
+    category: demand_shock
+    china_supply: false
+    source: "https://energyriskiq.com/research/global-energy-risk-timeline"
+    note: "WHO 1月30日宣布PHEIC；全球封锁致需求崩塌（峰值约-3000万桶/日），4月20日WTI近月合约收-37.63美元，史上首次负价。"
+    phases:
+      - {start: "2020-04-15", end: "2020-04-24", intensity: 1.0, note: "4月20日WTI负价，储油能力见顶"}
+
+  - name: "俄沙价格战、OPEC+谈判破裂"
+    start: "2020-03-06"
+    end: "2020-04-01"
+    intensity: 0.8
+    category: supply_policy
+    china_supply: false
+    source: "https://m.cls.cn/detail/1316920"
+    note: "3月6日OPEC+会议破裂，沙特增产并下调官价，3月9日开盘油价跌近30%，为1991年海湾战争以来最大单日跌幅。"
+
+  - name: "OPEC+ 历史性减产970万桶/日"
+    start: "2020-04-12"
+    end: "2020-07-31"
+    intensity: 0.8
+    category: supply_policy
+    china_supply: false
+    source: "http://news.china.com.cn/2020-04/13/content_75926880.htm"
+    note: "4月12日OPEC+达成史上最大减产，5-6月减产970万桶/日，7月起降至770万桶/日；美巴加同步减产。"
+
+  # ---- 2021 ----------------------------------------------------------------
+  - name: "美国得州极寒，二叠纪盆地产能大面积关停"
+    start: "2021-02-13"
+    end: "2021-02-24"
+    intensity: 0.5
+    category: supply_outage
+    china_supply: false
+    source: "http://www.cnr.cn/jingji/txcj/20210218/t20210218_525416090.shtml"
+    note: "2月中旬得州遭遇罕见极寒（近-20℃），原油/成品油生产与炼化大面积冻停，一度关停约数百万桶/日。"
+
+  - name: "长赐号搁浅苏伊士运河"
+    start: "2021-03-23"
+    end: "2021-03-29"
+    intensity: 0.5
+    category: supply_outage
+    china_supply: false
+    source: "https://www.xinhuanet.com/world/2021-03/25/c_1211083935.htm"
+    note: "3月23日长赐号在苏伊士运河搁浅，3月29日脱困，运河瘫痪近一周，原油/LNG航运延误。"
+
+  - name: "OPEC+ 增产僵局后达成和解"
+    start: "2021-07-18"
+    end: "2021-08-18"
+    intensity: 0.3
+    category: supply_policy
+    china_supply: false
+    source: "https://aitimeline.in/opec-plus-production-cuts-history-timeline-10087/"
+    note: "7月初OPEC+因增产配额与基线分歧陷入僵局，7月18日达成和解，确认逐步增产路径。"
+
+  # ---- 2022 ----------------------------------------------------------------
+  - name: "俄罗斯全面入侵乌克兰，西方能源制裁"
+    start: "2022-02-24"
+    end: "2022-12-31"
+    intensity: 0.8
+    category: geopolitical
+    china_supply: false
+    source: "http://m.ce.cn/yw/gd/202203/07/t20220307_37381912.shtml"
+    note: "2月24日俄乌冲突爆发，约10%全球原油供应受冲击，俄油流向重构；3月7日Brent盘中破139美元（13年新高），3月8日美禁俄油气、IEA释储6000万桶。"
+    phases:
+      - {start: "2022-03-07", end: "2022-03-18", intensity: 1.0, note: "Brent盘中破139、美英禁俄油、IEA释储，恐慌峰值"}
+
+  - name: "OPEC+ 减产200万桶/日"
+    start: "2022-10-05"
+    end: "2022-11-05"
+    intensity: 0.55
+    category: supply_policy
+    china_supply: false
+    source: "http://www.news.cn/world/2022-12/05/c_1129183286.htm"
+    note: "10月5日OPEC+第33次部长级会议决定11月起在8月产量基础上日均下调200万桶（约全球需求2%）。"
+
+  - name: "G7/EU 对俄海运原油60美元价格上限与欧盟禁运生效"
+    start: "2022-12-05"
+    end: "2023-01-05"
+    intensity: 0.55
+    category: geopolitical
+    china_supply: false
+    source: "http://world.people.com.cn/n1/2022/1205/c1002-32580682.html"
+    note: "12月5日欧盟对俄海运原油禁运与G7/澳60美元/桶价格上限同步生效，俄油加速转向中印。"
+
+  # ---- 2023 ----------------------------------------------------------------
+  - name: "OPEC+ 多国自愿减产约166万桶/日"
+    start: "2023-04-02"
+    end: "2023-05-15"
+    intensity: 0.5
+    category: supply_policy
+    china_supply: false
+    source: "https://www.stcn.com/article/detail/832795.html"
+    note: "4月2日多国宣布5月起至2023年底自愿减产合计约166万桶/日，4月3日油价高开近7%。"
+
+  - name: "沙特额外自愿减产100万桶/日"
+    start: "2023-06-04"
+    end: "2024-03-31"
+    intensity: 0.45
+    category: supply_policy
+    china_supply: false
+    source: "http://www.news.cn/world/20240304/f0f4f344333c41f1b45b651fb6855442/c.html"
+    note: "6月4日沙特宣布7月起额外减产100万桶/日（合计150万），此后多次延长至2024年3月底。"
+
+  - name: "红海胡塞袭船危机（Galaxy Leader 被扣）"
+    start: "2023-11-19"
+    end: "2024-12-31"
+    intensity: 0.6
+    category: geopolitical
+    china_supply: false
+    source: "https://world.people.com.cn/n1/2024/0130/c1002-40169720.html"
+    note: "11月19日胡塞武装在红海扣押Galaxy Leader号并持续袭船，船只绕行好望角；2024年1月12日美英空袭胡塞后油价升至约80美元。主要冲击曼德海峡/苏伊士航线。"
+    phases:
+      - {start: "2024-01-12", end: "2024-02-12", intensity: 0.8, note: "美英连续空袭胡塞，红海风险升级"}
+
+  # ---- 2024 ----------------------------------------------------------------
+  - name: "伊朗首次从本土直接打击以色列，以色列反击伊斯法罕"
+    start: "2024-04-13"
+    end: "2024-04-30"
+    intensity: 0.55
+    category: geopolitical
+    china_supply: true
+    source: "http://finance.cnr.cn/2014jingji/20240419/t20240419_526672026.shtml"
+    note: "4月13-14日伊朗向以色列发射数十枚导弹/无人机（首次从本土直接打击），4月19日以色列有限反击伊斯法罕，当日Brent上破90美元。"
+
+  - name: "10月伊以直接互袭"
+    start: "2024-10-01"
+    end: "2024-11-15"
+    intensity: 0.5
+    category: geopolitical
+    china_supply: true
+    source: "https://m.baike.com/wiki/2024%E5%B9%B410%E6%9C%88%E4%BC%8A%E4%BB%A5%E5%86%B2%E7%AA%81/7420694004616462355"
+    note: "10月1日伊朗向以色列发射约180枚导弹，10月26日以色列发动空袭报复，中东风险溢价反复。"
+
+  - name: "OPEC+ 宣布逐步退出自愿减产"
+    start: "2024-06-02"
+    end: "2024-07-02"
+    intensity: 0.35
+    category: supply_policy
+    china_supply: false
+    source: "https://aitimeline.in/opec-plus-production-cuts-history-timeline-10087/"
+    note: "6月2日OPEC+会议宣布2024年底至2025年分阶段退出220万桶/日自愿减产（后因市场多次调整节奏）。"
+
+  # ---- 2025 ----------------------------------------------------------------
+  - name: "OPEC+ 进入增产周期，220万桶减产逐步解除"
+    start: "2025-04-01"
+    end: "2025-12-31"
+    intensity: 0.4
+    category: supply_policy
+    china_supply: false
+    source: "http://www.chinanews.com.cn/cj/2025/08-05/10459559.shtml"
+    note: "2025年3月8国决定4月起逐步增产：4月+13.8万桶/日，5-7月各+41.1万，8月+54.8万，9月+54.7万（220万桶减产全面解除），10-12月各+13.7万。"
+    phases:
+      - {start: "2025-08-03", end: "2025-09-15", intensity: 0.55, note: "8月3日决定9月增产54.7万桶/日，减产协议全面解除"}
+
+  - name: "以色列空袭伊朗'十二日战争'"
+    start: "2025-06-13"
+    end: "2025-06-24"
+    intensity: 0.7
+    category: geopolitical
+    china_supply: true
+    source: "http://paper.people.com.cn/zgnyb/pad/content/202506/16/content_30080300.html"
+    note: "6月13日以色列空袭伊朗，Brent单日涨10.28%至76.48、盘中78.5，SC同步飙升；6月21日美国介入升级，6月23日宣布停火，23-24日油价两日回吐逾12%。"
+    phases:
+      - {start: "2025-06-21", end: "2025-06-23", intensity: 0.9, note: "美国介入战局，恐慌峰值"}
+
+  # ---- 2026 ----------------------------------------------------------------
+  - name: "美以联合打击伊朗、霍尔木兹海峡封锁（战争主冲突段）"
+    start: "2026-02-28"
+    end: "2026-04-08"
+    intensity: 1.0
+    category: geopolitical
+    china_supply: true
+    source: "http://world.people.com.cn/n1/2026/0228/c1002-40672325.html"
+    note: "2月28日美以联合打击伊朗，伊朗革命卫队宣布禁止船只通过霍尔木兹海峡，油轮航速普遍降至零；3月1日WTI盘中涨12.4%至75.33，7个交易日Brent累涨约60%。中国为伊朗/海湾原油主要买家。"
+    phases:
+      - {start: "2026-03-11", end: "2026-03-20", intensity: 0.9, note: "IEA 32国同意释放4亿桶战略储备（史上最大），海峡'已成战场'"}
+
+  - name: "美伊停火谈判与海上封锁下的低烈度对峙"
+    start: "2026-04-09"
+    end: "2026-07-07"
+    intensity: 0.5
+    category: geopolitical
+    china_supply: true
+    source: "https://www3.xinhuanet.com/world/20260828/01c950062ca14a43a719c138e407d17e/c.html"
+    note: "4月7日美方暂停空袭，4月8日停火消息令Brent单日暴跌逾16%；4月11日伊斯兰堡谈判无果，美实施海上封锁，名义停火但低烈度交火持续，6月18日签谅解备忘录。"
+
+  - name: "战事再起：美军再攻伊朗、胡塞袭沙特油轮、油轮战升级"
+    start: "2026-07-08"
+    end: null
+    intensity: 0.75
+    category: geopolitical
+    china_supply: true
+    source: "http://www3.xinhuanet.com/world/20260708/b37e19c96b064451abd32bd8a5760930/c.html"
+    note: "7月8日美军再次攻击伊朗、停火生变，Brent盘中约78涨超5%；7月23日胡塞袭击两艘沙特油轮，Brent一度105、7月收96.80，霍尔木兹持续关闭、成品油裂解创纪录。"
+    phases:
+      - {start: "2026-07-08", end: "2026-07-31", intensity: 0.9, note: "美军再攻+胡塞袭沙特油轮，Brent一度105"}
+      - {start: "2026-09-09", end: null, intensity: 1.0, note: "油轮战升级、胡塞进占哈尼什群岛威胁曼德海峡"}
+
+  - name: "阿联酋正式退出 OPEC/OPEC+"
+    start: "2026-05-01"
+    end: "2026-05-31"
+    intensity: 0.3
+    category: supply_policy
+    china_supply: false
+    source: "http://world.people.com.cn/n1/2026/0906/c1002-40793380.html"
+    note: "5月1日阿联酋正式退出OPEC及OPEC+，并被允许额外增产约30万桶/日；1-3月八国曾因季节性暂停增产、4月恢复，9月6日决定10月维持产量不变。"
