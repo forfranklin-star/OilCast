@@ -910,3 +910,79 @@ def test_direction_layer_persists_across_pickle(tmp_path):
     ep1 = fc.predict(X.iloc[[-1]], float(price.iloc[-1]), future).endpoint
     ep2 = fc2.predict(X.iloc[[-1]], float(price.iloc[-1]), future).endpoint
     assert ep2["dir_stance"] == ep1["dir_stance"]
+
+
+# ---------------------------------------------------------------- 本轮修复回归
+def test_sc_dominant_continuous_removes_roll_gap():
+    """持仓量主力 + 同合约比例复权：换月日收益必须等于新合约自身收益，而非跨合约假跳空。"""
+    from oilcast.data_sources.sc_contracts import build_dominant_continuous
+    idx = pd.bdate_range("2026-01-05", periods=35)
+    old_c = np.linspace(100.0, 102.0, 30).tolist() + [90.0, np.nan, np.nan, np.nan, np.nan]
+    old_oi = [1000] * 30 + [100, 0, 0, 0, 0]                  # SC2610 近月逼仓后摘牌
+    new_c = np.linspace(95.0, 97.0, 30).tolist() + [98.0, 99.0, 100.0, 101.0, 102.0]
+    new_oi = [500] * 30 + [1200, 1300, 1400, 1500, 1600]      # SC2611 第31日起持仓反超
+    old = pd.DataFrame({"close": old_c, "oi": old_oi}, index=idx)
+    new = pd.DataFrame({"close": new_c, "oi": new_oi}, index=idx)
+    dom = build_dominant_continuous({"SC2610": old, "SC2611": new})
+    assert dom["main"].iloc[29] == "SC2610"
+    assert (dom["main"].iloc[30:] == "SC2611").all()
+    # 换月日(第31行)：SC0 原始拼接会是 98/102-1≈-3.9%（假跳空）；同合约应为 98/97-1≈+1.0%
+    roll_ret = dom["adj_ret"].iloc[30]
+    assert abs(roll_ret - (98.0 / 97.0 - 1.0)) < 1e-9
+    assert abs(roll_ret - (98.0 / 102.0 - 1.0)) > 0.02
+    assert abs(dom["adj_factor"].iloc[-1] - 1.0) < 1e-12       # 最新日复权因子=1
+    assert abs(dom["adj_close"].iloc[-1] - 102.0) < 1e-9       # 最新价=新主力真实收盘
+
+
+def test_detected_events_auto_expand_regimes():
+    """yaml 结束日后的新重大事件由累积 RSS 自动展开：分类/对华链路/噪声过滤/无泄漏/衰减。"""
+    from oilcast.features.engineering import _detected_event_regimes
+    idx = pd.bdate_range("2027-01-04", periods=60)
+    ev = pd.DataFrame([
+        {"date": idx[10], "title": "Iranian oil tanker struck by drone in Strait of Hormuz, oil surges",
+         "theme": "geopolitical_risk", "intensity": 0.9},
+        {"date": idx[40], "title": "Houthi attack on cargo ship in Red Sea escalates",
+         "theme": "geopolitical_risk", "intensity": 0.7},
+        {"date": idx[41], "title": "Oil dips as market eyes routine inventory data",
+         "theme": "demand_outlook", "intensity": 0.1},
+    ])
+    r = _detected_event_regimes(idx, ev)
+    # 事件前无泄漏
+    assert (r.loc[idx[:9]] == 0).all().all()
+    # 霍尔木兹油轮：地缘 + 对华供油链路双高
+    assert r.loc[idx[10], "hist_geo_regime"] > 0.8
+    assert r.loc[idx[10], "hist_china_supply_regime"] > 0.8
+    # 红海袭船（距油轮事件 30 交易日、已出其 20 日衰减窗）：地缘高、对华链路=0
+    assert r.loc[idx[40], "hist_geo_regime"] > 0.5
+    assert r.loc[idx[40], "hist_china_supply_regime"] == 0.0
+    # 低强度库存噪声（demand 主题，强度 0.1<门槛）被过滤，不产生任何 demand 信号
+    assert r.loc[idx[41], "hist_demand_regime"] == 0.0
+    # 当日 geo 非零只能来自前一日红海事件的衰减尾巴（0.85*0.94），与库存噪声无关
+    assert abs(r.loc[idx[41], "hist_geo_regime"] - 0.85 * 0.94) < 1e-9
+    # 衰减：油轮事件 19 个交易日后强度已明显低于首日
+    assert r.loc[idx[29], "hist_geo_regime"] < r.loc[idx[10], "hist_geo_regime"]
+
+
+def test_anchor_panel_updates_all_five_and_sc_roll():
+    """02:30 同时刻面板必须覆盖五品种（不止上海），上海再按换月复权因子校正。"""
+    from oilcast.features.intraday_align import apply_anchor_panel_to_prices
+    idx = pd.bdate_range("2026-09-14", periods=5)
+    cols = ["wti", "brent", "shanghai_crude", "heating_oil", "gasoil"]
+    prices = pd.DataFrame(100.0, index=idx, columns=cols)
+    panel = pd.DataFrame({
+        "wti": [np.nan, np.nan, np.nan, 99.6, 98.0],
+        "brent": [np.nan, np.nan, np.nan, 103.2, 102.0],
+        "shanghai_crude": [np.nan, np.nan, np.nan, 800.0, 734.8],
+        "heating_oil": [np.nan, np.nan, np.nan, 5.04, 5.0],
+        "gasoil": [np.nan, np.nan, np.nan, 1485.0, 1470.0],
+    }, index=idx)
+    factor = pd.Series([np.nan, np.nan, np.nan, 0.9, 1.0], index=idx)
+    out = apply_anchor_panel_to_prices(prices, panel, factor)
+    # 五品种在覆盖日都被更新（外盘同样切到 02:30 同刻，而非保留日收盘）
+    for c in ["wti", "brent", "heating_oil", "gasoil"]:
+        assert out[c].iloc[3] == panel[c].iloc[3]
+    # 上海按复权因子缩放：800*0.9=720；最新日因子=1 保持真实价
+    assert abs(out["shanghai_crude"].iloc[3] - 720.0) < 1e-9
+    assert abs(out["shanghai_crude"].iloc[4] - 734.8) < 1e-9
+    # 面板缺失的更早交易日保持原值（不造数）
+    assert (out.iloc[:3] == 100.0).all().all()

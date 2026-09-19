@@ -309,24 +309,125 @@ _HIST_REGIME_SPECS = {
     "hist_china_supply_regime": lambda e: bool(e.get("china_supply")),
 }
 
+# ------------------------------------------------------------------ 机器核验重大事件
+# 年表自动扩充：人工 yaml 覆盖可核验的历史基线；yaml 结束日之后新发生的重大事件，由每日
+# 抓取并【长期累积入库】的真实 RSS 事件（events 表，带 title/url/date）经高门槛规则筛出，
+# 自动展开进历史 regime。门槛刻意从严（主题高影响词 + 标题强度≥0.5），避免标题党污染十年模型。
+_RSS_THEME_TO_BUCKET = {
+    "geopolitical_risk": "geo",
+    "supply_disruption": "supply",
+    "demand_outlook": "demand",
+}
+_DETECT_IMPACT_WORDS = {
+    "geo": ("war", "airstrike", "air strike", "missile", "drone", "attack", "attacks",
+            "strike", "strikes", "tanker", "hormuz", "iran", "iranian", "israel", "israeli",
+            "gaza", "houthi", "red sea", "sanction", "sanctions", "embargo", "invasion",
+            "escalat", "ceasefire", "abqaiq", "seize", "seized", "seizure", "military",
+            "conflict", "nuclear", "saudi", "iraq", "syria", "terror"),
+    "supply": ("opec", "production cut", "output cut", "supply cut", "voluntary cut",
+               "deepen cut", "extend cuts", "extends cuts", "spr", "strategic petroleum",
+               "embargo", "halt export", "export halt", "pipeline", "outage",
+               "refinery fire", "shutdown", "supply disruption", "cuts output"),
+    "demand": ("recession", "lockdown", "pandemic", "demand collapse", "financial crisis",
+               "tariff war", "global slowdown", "demand destruction"),
+}
+# 直接扰动对华中东供油链路（上海 INE 特异）：伊朗/霍尔木兹/油轮/沙特设施等；
+# 俄乌、红海（主要扰动欧洲航线）不含这些词，机器规则同样判为非对华链路，与人工年表一致。
+_CHINA_SUPPLY_WORDS = ("iran", "hormuz", "tanker", "abqaiq", "persian gulf", "strait",
+                       "saudi oil", "gulf oil", "middle east crude", "chinese buyer",
+                       "china oil", "asian buyer")
+# 各主题机器事件的衰减窗口（交易日）与日衰减系数：刻画"突发→持续关注→平息"，
+# 持续报道会以新的事件行刷新/取 max（自然延长），报道停止则指数衰减到 0，无需人工定 end。
+_DETECT_DECAY_TD = {"geo": 20, "supply": 15, "demand": 20}
+_DETECT_DECAY = 0.94
+_DETECT_INTENSITY_MIN = 0.5
 
-def historical_event_regimes(index: pd.DatetimeIndex) -> pd.DataFrame:
-    """把十年重大事件年表按主题展开为日频状态序列（无未来函数，截至 t 只反映当时状态）。
 
+def _detected_event_regimes(index: pd.DatetimeIndex, detected_events: Optional[pd.DataFrame]
+                            ) -> pd.DataFrame:
+    """把长期累积的真实 RSS 事件按高门槛规则筛为重大事件，展开为分主题衰减状态序列。
+
+    第 t 行只含报道日 date<=t 的事件（无未来泄漏）；报道落在非交易日时归到其后第一个
+    交易日（as-of，不向前取）。事件 title/url/date 均在 events 表可追溯，这里只做透明的
+    规则映射与衰减，不生成任何无来源的事件。detected_events 为空时返回全 0（不造数）。
+    """
+    cols = list(_HIST_REGIME_SPECS.keys())
+    out = pd.DataFrame(0.0, index=index, columns=cols)
+    if detected_events is None or len(detected_events) == 0:
+        return out
+    ev = detected_events.copy()
+    ev["date"] = pd.to_datetime(ev["date"]).dt.normalize()
+    col = {c: j for j, c in enumerate(cols)}
+    for _, r in ev.iterrows():
+        bucket = _RSS_THEME_TO_BUCKET.get(str(r.get("theme", "")))
+        if bucket is None:
+            continue
+        title = str(r.get("title", "")).lower()
+        if not any(w in title for w in _DETECT_IMPACT_WORDS[bucket]):
+            continue
+        try:
+            inten = float(r.get("intensity", 0) or 0)
+        except (TypeError, ValueError):
+            inten = 0.0
+        if inten < _DETECT_INTENSITY_MIN:
+            continue
+        d = pd.Timestamp(r["date"])
+        if d not in index:
+            nxt = index[index >= d]
+            if len(nxt) == 0:
+                continue
+            d = nxt[0]
+        i0 = index.get_loc(d)
+        base = min(1.0, 0.5 + 0.5 * inten)
+        n_decay = _DETECT_DECAY_TD[bucket]
+        target_cols = ["hist_geo_regime"] if bucket == "geo" else (
+            ["hist_supply_regime"] if bucket == "supply" else ["hist_demand_regime"])
+        if bucket == "geo" and any(w in title for w in _CHINA_SUPPLY_WORDS):
+            target_cols.append("hist_china_supply_regime")
+        for k in range(n_decay):
+            if i0 + k >= len(index):
+                break
+            val = base * (_DETECT_DECAY ** k)
+            for cname in target_cols:
+                j = col[cname]
+                if val > out.iat[i0 + k, j]:
+                    out.iat[i0 + k, j] = val
+    return out
+
+
+def historical_event_regimes(index: pd.DatetimeIndex,
+                             detected_events: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    """把重大事件按主题展开为日频状态序列（无未来函数，截至 t 只反映当时状态）。
+
+    两个来源合并（同日取强度最大者）：
+      1) data/reference/major_events.yaml 人工核验年表——公开事实日期+来源的历史基线，
+         覆盖疫情/俄乌/袭船战/OPEC+ 等十年重大事件，连续状态与升级阶段；
+      2) detected_events——每日抓取并长期累积入库的真实 RSS 事件，经高门槛规则机器核验后
+         自动展开（衰减窗口），使 yaml 结束日之后【新发生】的重大事件无需改代码即可进入
+         模型，实现年表的自动扩充；机器事件在数据谱系中标注为"规则核验"，区别于人工年表。
     返回四列：
       hist_geo_regime           地缘冲突/制裁/袭船/设施遇袭
       hist_supply_regime        OPEC+/SPR 产量政策 + 非地缘实物中断
       hist_demand_regime        需求侧冲击（疫情/金融危机）
       hist_china_supply_regime  直接扰动对华中东供油链路的事件（上海 INE 特异因子）
-    无年表文件时四列整列 NaN（显式缺失，绝不造数）。
+    人工年表与机器事件都缺失时四列整列 NaN（显式缺失，绝不造数）。
     """
     cols = list(_HIST_REGIME_SPECS.keys())
     events = _load_major_events()
-    if not events:
-        return pd.DataFrame({c: pd.Series(np.nan, index=index) for c in cols}, index=index)
-    data = {name: _event_regime_subset(index, events, pred)
-            for name, pred in _HIST_REGIME_SPECS.items()}
-    return pd.DataFrame(data, index=index)
+    if events:
+        data = {name: _event_regime_subset(index, events, pred)
+                for name, pred in _HIST_REGIME_SPECS.items()}
+        df = pd.DataFrame(data, index=index)
+    else:
+        df = pd.DataFrame({c: pd.Series(np.nan, index=index) for c in cols}, index=index)
+    has_detected = detected_events is not None and len(detected_events) > 0
+    if has_detected:
+        det = _detected_event_regimes(index, detected_events)
+        if events:
+            df = pd.DataFrame(np.maximum(df.values, det.values), index=index, columns=cols)
+        else:
+            df = det
+    return df
 
 
 def conditional_geo_sensitivity(prices: pd.DataFrame, targets: list,
@@ -497,7 +598,8 @@ def build_features(prices: pd.DataFrame, macro: pd.DataFrame,
                    events_available: bool = True,
                    views_available: bool = True,
                    use_session_align: bool = True,
-                   intraday_session: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+                   intraday_session: Optional[pd.DataFrame] = None,
+                   detected_events: Optional[pd.DataFrame] = None) -> pd.DataFrame:
     """返回对齐后的特征矩阵；缺失保持 NaN，不做零值填充。
 
     所有外生于目标品种的序列（其他油种、宏观/汇率）先按各市场真实收盘 UTC 时刻 as-of 到
@@ -572,10 +674,11 @@ def build_features(prices: pd.DataFrame, macro: pd.DataFrame,
     # 更多连续技术指标对 10 日方向无增量，故只保留这一列可解释的事件状态锚，点预测幅度再由
     # 模型层的样本外 β 校准统一控制。
     feats["major_event_regime"] = major_event_regime(idx)
-    # 十年重大事件按主题展开的日频状态锚（地缘 / 供给政策与实物中断 / 需求 / 对华供油链路），
-    # 与 major_event_regime 同源于 data/reference/major_events.yaml；让各因素在十年样本内都有
-    # 真实事件历史可学，尤其上海 INE 对霍尔木兹/伊朗事件的敏感度（见 historical_event_regimes）。
-    _hist_regimes = historical_event_regimes(idx)
+    # 十年重大事件按主题展开的日频状态锚（地缘 / 供给政策与实物中断 / 需求 / 对华供油链路）：
+    # 人工核验年表（major_events.yaml）打底，叠加每日抓取并长期累积入库、经高门槛规则机器核验
+    # 的真实 RSS 重大事件，使年表在 yaml 结束日后自动扩充、新冲突（如新一轮霍尔木兹/油轮事件）
+    # 无需改代码即可进入模型；尤其服务上海 INE 对伊朗/霍尔木兹事件的特异敏感度。
+    _hist_regimes = historical_event_regimes(idx, detected_events=detected_events)
     for _hc in _hist_regimes.columns:
         feats[_hc] = _hist_regimes[_hc]
 

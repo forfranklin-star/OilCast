@@ -197,6 +197,18 @@ class OilCastDB:
                              str(r.get("sentiment", "")), float(r.get("intensity", 0) or 0),
                              float(r.get("est_price_impact", 0) or 0), str(r.get("url", ""))))
 
+    def read_events(self) -> pd.DataFrame:
+        """读取长期累积的全部真实新闻事件（INSERT OR IGNORE、从不删除）。
+
+        供重大事件年表"自动扩充"：每日 RSS 抓取的真实事件持续累积，30 天滚动窗口滑过后
+        仍可作为机器核验的重大事件来源进入历史 regime。无数据返回空 DataFrame（不造数）。"""
+        with self._conn() as con:
+            df = pd.read_sql_query("SELECT * FROM events", con)
+        if df.empty:
+            return df
+        df["date"] = pd.to_datetime(df["date"])
+        return df.sort_values("date")
+
     def save_views(self, views: pd.DataFrame) -> None:
         if views is None or views.empty:
             return

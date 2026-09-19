@@ -53,8 +53,9 @@ def load_report(date: str | None) -> dict | None:
 
 def run_pipeline() -> None:
     cmd = [sys.executable, "-m", "oilcast.pipeline.main"]
-    with st.spinner("正在采集真实数据、训练模型并生成报告；首次冷启动约 3~5 分钟，"
-                    "之后每日复用门控证据约 1~2 分钟，请勿关闭或刷新页面…"):
+    with st.spinner("正在采集真实数据、训练模型并生成报告；首次冷启动约 8~15 分钟"
+                    "（需采集历史数据、训练并完成回测，取决于网络），之后每日增量运行约 3~6 分钟，"
+                    "请勿关闭或刷新页面…"):
         proc = subprocess.run(cmd, cwd=str(PROJECT_ROOT / "src"),
                               capture_output=True, text=True)
     if proc.returncode not in (0,):

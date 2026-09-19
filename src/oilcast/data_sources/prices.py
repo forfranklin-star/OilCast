@@ -15,6 +15,7 @@ from ..utils import get_logger, run_with_timeout
 from .cnbc_client import fetch_cnbc_bars
 from .cn_futures_client import fetch_sina_inner, fetch_eastmoney_inner
 from .fred_client import fetch_fred, fred_url
+from .sc_contracts import fetch_sc_dominant_continuous
 from .sources import run_chain
 from .treasury_client import fetch_treasury_curve  # noqa: F401  (供宏观复用)
 from .yahoo_client import fetch_yahoo_chart
@@ -137,6 +138,30 @@ def fetch_prices(as_of: datetime, history_days: int
     meta: Dict[str, dict] = {}
     out = {}
     for field in price_fields:
+        # 上海原油：优先使用"持仓量最大主力 + 同合约换月比例复权"的连续日 K，消除 SC0 主力
+        # 连续在换月日拼接不同月份合约造成的虚假跳空（含近月交割前逼仓异动）；原始各合约
+        # 真实收盘/持仓缓存于 data/cache/sc_contracts 可审计。重建失败才回退到源链原始 SC0，
+        # 回退时口径如实标注为"未换月调整"，绝不造数。
+        if field == "shanghai_crude":
+            sc = fetch_sc_dominant_continuous(start, end)
+            if sc is not None:
+                s_sc, sc_meta = sc
+                s_sc = s_sc.sort_index().loc[
+                    lambda x: (pd.to_datetime(x.index) >= start) &
+                              (pd.to_datetime(x.index) <= end + timedelta(days=1))]
+                if len(s_sc) >= 20:
+                    out[field] = s_sc
+                    meta[field] = {
+                        "source_name": "新浪INE持仓量主力连续",
+                        "url": sc_meta.get("url", ""),
+                        "frequency": "daily_business",
+                        "attempts": [],
+                        "caliber": sc_meta.get("caliber", ""),
+                        "note": (f"口径：{sc_meta.get('caliber','')}；{sc_meta.get('n_contracts',0)}"
+                                 f"个月份合约、{sc_meta.get('n_rolls',0)}次换月，按每日持仓量最大"
+                                 f"定主力、同合约收益比例复权；统计主节点02:30由分时覆盖"),
+                    }
+                    continue
         result = run_chain(_build_providers(chains.get(field, []), start, end),
                            field_name=field, min_obs=20, chain_timeout_sec=120,
                            select="freshest")

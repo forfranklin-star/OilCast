@@ -75,6 +75,48 @@ def synchronized_panels(long_df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
     return out
 
 
+def roll_adjust_panel_sc(panel: pd.DataFrame, sc_factor: Optional[pd.Series]) -> pd.DataFrame:
+    """对同时刻面板中的上海原油（未复权 SC0 连续）按日 K 主力复权因子做换月校正。
+
+    复权因子按交易日对齐（最新日=1），消除盘中序列在换月日的虚假跳空，使盘中上海与日 K
+    换月调整连续同一口径；面板缺失或无因子时原样返回，绝不造数。
+    """
+    if panel is None or panel.empty or sc_factor is None or "shanghai_crude" not in panel:
+        return panel
+    p = panel.copy()
+    p.index = pd.to_datetime(p.index).normalize()
+    f = pd.Series(sc_factor).copy()
+    f.index = pd.to_datetime(f.index).normalize()
+    ff = f.reindex(p.index)
+    ok = ff.notna() & p["shanghai_crude"].notna()
+    if ok.any():
+        p.loc[ok, "shanghai_crude"] = p.loc[ok, "shanghai_crude"] * ff.loc[ok]
+    return p
+
+
+def apply_anchor_panel_to_prices(prices: pd.DataFrame, panel: pd.DataFrame,
+                                 sc_factor: Optional[pd.Series] = None) -> pd.DataFrame:
+    """把同一真实时刻的锚点面板（如北京 02:30 夜盘收盘）覆盖到日频价格表。
+
+    关键：面板含【全部品种】，覆盖后五品种在分时覆盖窗口内统一到同一统计时刻（此前只更新
+    上海、外盘仍用各自美盘日收盘，导致变化率不可比）。若上海面板仍是未复权 SC0，可传入日 K
+    持仓量主力重建的比例复权因子 ``sc_factor``（按交易日）在覆盖前校正换月跳空；调用方若已
+    用 :func:`roll_adjust_panel_sc` 复权过面板则传 None。仅覆盖有真实成交的格子，缺失保持 NaN。
+    返回更新后的副本，不改写传入表；原始日 K 已在数据库另行落库保留。
+    """
+    out = prices.copy()
+    if panel is None or panel.empty:
+        return out
+    p = roll_adjust_panel_sc(panel, sc_factor)
+    p.index = pd.to_datetime(p.index).normalize()
+    p = p.reindex(out.index)
+    for c in [c for c in out.columns if c in p.columns]:
+        m = p[c].notna()
+        if m.any():
+            out.loc[m, c] = p.loc[m, c]
+    return out
+
+
 def synchronized_day_panel(long_df: pd.DataFrame) -> pd.DataFrame:
     """日盘收盘(15:00)同时刻面板——上海原油跨市场对齐主口径。"""
     return synchronized_panels(long_df).get("day_1500", pd.DataFrame())

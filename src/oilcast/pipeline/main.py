@@ -23,7 +23,9 @@ from ..config import get_config, ensure_dirs
 from ..data_sources.collector import collect
 from ..data_sources.calendar import (next_trading_days, closed_holiday_mmdd)
 from ..data_sources.intraday_client import collect_intraday
-from ..features.intraday_align import synchronized_panels, sc_brent_premium_usd
+from ..data_sources.sc_contracts import sc_adjustment_factor_by_date
+from ..features.intraday_align import (synchronized_panels, sc_brent_premium_usd,
+                                       apply_anchor_panel_to_prices, roll_adjust_panel_sc)
 from ..features.engineering import (FACTOR_GROUPS, build_features,
                                     factor_availability, make_supervised,
                                     conditional_geo_sensitivity)
@@ -125,6 +127,22 @@ def run(as_of: Optional[datetime] = None, require_prices: bool = False,
     save_csv_snapshot(bundle.prices, bundle.macro, report_date)
     prices, macro, events, views = bundle.prices, bundle.macro, bundle.events, bundle.views
 
+    # 重大事件年表"自动扩充"：events 表每日 INSERT OR IGNORE、长期累积且从不删除。读取库内
+    # 全部真实 RSS 事件并合并本次抓取，作为机器核验重大事件源传入特征层——yaml 人工年表覆盖
+    # 可核验历史，库内累积事件让 yaml 结束日之后新发生的重大冲突自动进入历史 regime。
+    detected_events = None
+    try:
+        hist_events = db.read_events()
+        frames = [df for df in (hist_events, events) if df is not None and not df.empty]
+        if frames:
+            detected_events = pd.concat(frames, ignore_index=True)
+            detected_events = (detected_events.drop_duplicates(["date", "title"])
+                               .sort_values("date").reset_index(drop=True))
+            LOG.info("年表自动扩充：机器核验候选真实事件 %d 条（库内累积+本次）",
+                     len(detected_events))
+    except Exception as exc:
+        LOG.warning("累积事件读取失败，本期历史 regime 仅用人工年表：%s", exc)
+
     # 1b) 盘中分时采集与"同一真实时刻"面板（长期增量积累；失败不阻断，退化为日频 as-of）
     intraday_day = pd.DataFrame()
     intraday_night = pd.DataFrame()
@@ -140,17 +158,28 @@ def run(as_of: Optional[datetime] = None, require_prices: bool = False,
             intraday_night = panels.get("night_0230", pd.DataFrame())
             LOG.info("同时刻面板：15:00 %d 日、02:30 %d 日",
                      len(intraday_day), len(intraday_night))
-            # 上海原油统计主节点=夜盘 02:30 收盘：在分时覆盖窗口用 02:30 收盘价更新日频序列，
-            # 使走势图/叙事/预测起点与"上海连续交易真正收盘"一致（原始日 K 已落库保留，不改写）。
-            if not intraday_night.empty and "shanghai_crude" in intraday_night.columns:
-                _n = intraday_night.copy()
-                _n.index = pd.to_datetime(_n.index).normalize()
-                _n = _n.reindex(prices.index)
-                _m = _n["shanghai_crude"].notna()
-                if _m.any():
-                    prices.loc[_m, "shanghai_crude"] = _n.loc[_m, "shanghai_crude"]
-                    LOG.info("上海原油按夜盘02:30收盘更新 %d 个交易日（统计主节点）",
-                             int(_m.sum()))
+            # 上海分时 SC0 是未复权主力连续，换月日有跳空：用日 K 持仓量主力重建的同一套比例
+            # 复权因子，在【面板层】校正 15:00 与 02:30 两个同时刻面板的上海列，使下游价格序列、
+            # 跨市场外生特征、美元升贴水三处口径一致（失败则沿用未复权 SC0，不造数）。
+            _sc_fac = None
+            if "shanghai_crude" in intraday_night.columns or "shanghai_crude" in intraday_day.columns:
+                try:
+                    _sc_fac = sc_adjustment_factor_by_date(as_of)
+                except Exception as exc:
+                    LOG.warning("上海分时换月复权因子计算失败，沿用未复权SC0：%s", exc)
+            intraday_day = roll_adjust_panel_sc(intraday_day, _sc_fac)
+            intraday_night = roll_adjust_panel_sc(intraday_night, _sc_fac)
+            # 分时覆盖窗口内，把【五个品种】统一锚到北京 02:30（上海夜盘收盘）这一同一真实
+            # 时刻：此时欧美电子盘仍在交易，取其同时刻盘中价（用户已确认按盘中价、不要求开/
+            # 收盘价）。此前只更新上海一个品种、外盘仍用各自美盘日收盘，导致五品种并非同一时刻、
+            # 变化率不可比（如上海日 K -7% 而外盘同刻仅 -1% 的虚假背离）。原始日 K 已落库保留。
+            if not intraday_night.empty:
+                _before = prices.copy()
+                prices = apply_anchor_panel_to_prices(prices, intraday_night, None)
+                _updated = [f"{c}:{int(prices[c].reindex(_before.index).ne(_before[c]).sum())}"
+                            for c in prices.columns if c in intraday_night.columns]
+                LOG.info("分时覆盖窗口五品种统一按北京02:30同时刻更新（更新交易日数）：%s",
+                         "，".join(x for x in _updated if not x.endswith(":0")))
     except Exception as exc:
         LOG.warning("分时同时刻面板构建失败，本期跨市场退化为日频 as-of：%s", exc)
 
@@ -178,7 +207,8 @@ def run(as_of: Optional[datetime] = None, require_prices: bool = False,
     vw_ok = bundle.field_status("institutional_view") == "ok"
     feats = {t: build_features(prices, macro, events, views, target=t,
                                events_available=ev_ok, views_available=vw_ok,
-                               intraday_session=intraday_night)
+                               intraday_session=intraday_night,
+                               detected_events=detected_events)
              for t in usable_targets}
     if feats:
         Path(cfg["storage"]["processed_dir"]).mkdir(parents=True, exist_ok=True)
