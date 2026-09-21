@@ -127,14 +127,25 @@ def sc_brent_premium_usd(day_panel: pd.DataFrame, usdcny: Optional[pd.Series]) -
 
     需要同时刻的上海(人民币/桶)、布伦特(美元/桶)与当日已知 USDCNY；任一缺失则该行留 NaN。
     仅做无量纲/同单位比较，不与成品油混用。返回列 sc_usd, brent_usd, premium_usd,
-    sc_brent_logspread（与日频特征同名口径，便于融合）。"""
-    out = pd.DataFrame(index=day_panel.index)
-    if day_panel.empty:
+    sc_brent_logspread（与日频特征同名口径，便于融合）。
+
+    冷启动健壮性：无论面板是否为空、是否缺上海/布伦特列、汇率是否就绪，都【始终返回这 4 列】，
+    缺数据的列为全 NaN（绝不造数）。否则下游 dropna(subset=["premium_usd"])/loc 取列会 KeyError
+    （CI 首次运行分时历史几乎为空时必现）。"""
+    out_cols = ["brent_usd", "sc_usd", "premium_usd", "sc_brent_logspread"]
+    idx = getattr(day_panel, "index", None)
+    out = pd.DataFrame(index=idx)
+    for c in out_cols:
+        out[c] = np.nan
+    if day_panel is None or day_panel.empty:
         return out
     if "shanghai_crude" not in day_panel or "brent" not in day_panel:
+        # 布伦特列若存在仍如实落 brent_usd，上海/升贴水留 NaN
+        if "brent" in day_panel:
+            out["brent_usd"] = day_panel["brent"]
         return out
     fx = None
-    if usdcny is not None:
+    if usdcny is not None and pd.Series(usdcny).notna().any():
         fx = pd.Series(usdcny).copy()
         fx.index = pd.to_datetime(fx.index).normalize()
         fx = fx[~fx.index.duplicated(keep="last")].sort_index().dropna()
@@ -144,7 +155,7 @@ def sc_brent_premium_usd(day_panel: pd.DataFrame, usdcny: Optional[pd.Series]) -
         fx = fx.reindex(daily).ffill(limit=7).reindex(day_panel.index)
     sc_cny = day_panel["shanghai_crude"]
     out["brent_usd"] = day_panel["brent"]
-    if fx is not None:
+    if fx is not None and fx.notna().any():
         out["sc_usd"] = sc_cny / fx
         out["premium_usd"] = out["sc_usd"] - out["brent_usd"]
         out["sc_brent_logspread"] = np.log(out["sc_usd"]) - np.log(out["brent_usd"])
