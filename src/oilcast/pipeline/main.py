@@ -169,17 +169,31 @@ def run(as_of: Optional[datetime] = None, require_prices: bool = False,
                     LOG.warning("上海分时换月复权因子计算失败，沿用未复权SC0：%s", exc)
             intraday_day = roll_adjust_panel_sc(intraday_day, _sc_fac)
             intraday_night = roll_adjust_panel_sc(intraday_night, _sc_fac)
-            # 分时覆盖窗口内，把【五个品种】统一锚到北京 02:30（上海夜盘收盘）这一同一真实
-            # 时刻：此时欧美电子盘仍在交易，取其同时刻盘中价（用户已确认按盘中价、不要求开/
-            # 收盘价）。此前只更新上海一个品种、外盘仍用各自美盘日收盘，导致五品种并非同一时刻、
-            # 变化率不可比（如上海日 K -7% 而外盘同刻仅 -1% 的虚假背离）。原始日 K 已落库保留。
-            if not intraday_night.empty:
-                _before = prices.copy()
-                prices = apply_anchor_panel_to_prices(prices, intraday_night, None)
-                _updated = [f"{c}:{int(prices[c].reindex(_before.index).ne(_before[c]).sum())}"
-                            for c in prices.columns if c in intraday_night.columns]
-                LOG.info("分时覆盖窗口五品种统一按北京02:30同时刻更新（更新交易日数）：%s",
-                         "，".join(x for x in _updated if not x.endswith(":0")))
+            # 分时覆盖窗口内，【只把上海原油】锚到北京 02:30（上海夜盘真正收盘）这一时刻。
+            # 海外四品种（WTI/Brent/美燃油/伦敦柴油）十年全程维持各自交易所日 K 结算口径
+            # （WTI/HO 同属 NYMEX、Brent/Gasoil 同属 ICE，各自严格同一结算时刻；两大交易所结算
+            # 时刻相差约 1 小时但落在同一 UTC 交易日，CNBC 日 K 已 normalize 到同一交易日，
+            # 跨市场外生特征再 as-of 只取已收盘市场），【不被上海的 02:30 分时窗口改写】，保证其
+            # 十年价格序列口径一致、模型不受亚洲品种对齐窗口影响。上海建模所需的【同时刻外盘价】
+            # 在 build_features(target=shanghai_crude) 内部从本面板取（仅作上海的跨市场外生特征，
+            # 不回写全局 prices）；五品种 02:30 同刻对比仍在报告"同一真实时刻"面板展示。原始日 K
+            # 已落库保留。面板上海列已在上方按换月因子复权。
+            if not intraday_night.empty and "shanghai_crude" in intraday_night.columns:
+                sc_panel = intraday_night[["shanghai_crude"]]
+                if sc_panel["shanghai_crude"].notna().any():
+                    # 仅在面板真正有 02:30 成交的交易日统计/覆盖（NaN.ne(NaN)=True 会把上海
+                    # 上市前的空行误计为"更新"，故先用 notna 掩码锁定覆盖窗口）
+                    _sc_aligned = sc_panel.copy()
+                    _sc_aligned.index = pd.to_datetime(_sc_aligned.index).normalize()
+                    _sc_aligned = _sc_aligned.reindex(prices.index)
+                    _mask = _sc_aligned["shanghai_crude"].notna()
+                    _before_sc = prices["shanghai_crude"].copy()
+                    prices = apply_anchor_panel_to_prices(prices, sc_panel, None)
+                    _n_upd = int(prices.loc[_mask, "shanghai_crude"]
+                                 .ne(_before_sc.loc[_mask]).fillna(False).sum())
+                    LOG.info("分时窗口上海原油按北京02:30夜盘收盘同时刻更新 %d/%d 个覆盖交易日；"
+                             "海外四品种维持交易所日K结算、十年口径不变",
+                             _n_upd, int(_mask.sum()))
     except Exception as exc:
         LOG.warning("分时同时刻面板构建失败，本期跨市场退化为日频 as-of：%s", exc)
 
@@ -570,7 +584,11 @@ def _build_session_sync(day: pd.DataFrame, night: pd.DataFrame, macro: pd.DataFr
                     "sc_usd": _clean(r.sc_usd), "brent_usd": _clean(r.brent_usd)}
                    for d, r in prem_curve.iterrows()]
     def _records(panel, with_fx):
+        if panel is None or getattr(panel, "empty", True):
+            return []
         price_cols = [c for c in ("shanghai_crude", "wti", "brent") if c in panel]
+        if not price_cols:
+            return []
         # 只展示至少有一个真实价格的交易日，剔除分时缺失的空行/未来占位行
         p = panel.dropna(how="all", subset=price_cols).tail(8)
         rows = []
@@ -587,7 +605,8 @@ def _build_session_sync(day: pd.DataFrame, night: pd.DataFrame, macro: pd.DataFr
     model_days = 0
     if sc_feats is not None:
         model_days = int(getattr(sc_feats, "attrs", {}).get("intraday_synchronized_days", 0) or 0)
-    both = pd.concat([day.dropna(how="all"), night.dropna(how="all")])
+    night_eff = night if night is not None else day.iloc[0:0]
+    both = pd.concat([day.dropna(how="all"), night_eff.dropna(how="all")])
     return {
         "available": True,
         "coverage_start": both.index.min().strftime("%Y-%m-%d") if len(both) else None,
