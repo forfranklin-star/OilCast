@@ -416,6 +416,55 @@ def test_intraday_synchronized_anchor_uses_same_instant_not_daytime_carry():
     assert np.isnan(night.loc[d2, "shanghai_crude"]) and np.isnan(night.loc[d2, "brent"])
 
 
+def test_premium_frame_always_has_columns_on_cold_start():
+    """CI 冷启动回归（曾 exit 1：KeyError ['premium_usd']）：分时面板为空/缺上海列/缺汇率时，
+    sc_brent_premium_usd 必须始终返回 4 列（缺值为 NaN），dropna(loc) 取列绝不 KeyError。"""
+    from oilcast.features.intraday_align import sc_brent_premium_usd
+    cols = ["brent_usd", "sc_usd", "premium_usd", "sc_brent_logspread"]
+    idx = pd.bdate_range("2026-09-14", "2026-09-18")
+    # 空面板 / None
+    for panel in (pd.DataFrame(), None):
+        out = sc_brent_premium_usd(panel, None)
+        assert list(out.columns) == cols
+        assert len(out.dropna(subset=["premium_usd"])) == 0
+    # 只有海外列、缺上海（GitHub 海外 runner 采不到新浪 15min 的典型情形）
+    overseas = pd.DataFrame({"wti": np.arange(len(idx), dtype=float),
+                             "brent": 100. + np.arange(len(idx))}, index=idx)
+    out = sc_brent_premium_usd(overseas, None)
+    assert list(out.columns) == cols and out["premium_usd"].isna().all()
+    # 有上海+布伦特但无汇率 / 汇率全 NaN
+    both = pd.DataFrame({"shanghai_crude": 730. + np.arange(len(idx)),
+                         "brent": 103. + np.arange(len(idx))}, index=idx)
+    assert sc_brent_premium_usd(both, None)["premium_usd"].isna().all()
+    nan_fx = pd.Series(np.nan, index=idx)
+    assert sc_brent_premium_usd(both, nan_fx)["premium_usd"].isna().all()
+    # 正常情形仍算出升贴水
+    fx = pd.Series(6.7, index=idx)
+    ok = sc_brent_premium_usd(both, fx)
+    assert ok["premium_usd"].notna().all()
+
+
+def test_build_session_sync_cold_start_no_crash():
+    """CI 冷启动：night=None、day 仅海外列、分时历史为空时，_build_session_sync 不得抛
+    KeyError/TypeError，应优雅降级（available=False 或 premium 为空、海外截面仍可展示）。"""
+    import types
+    from oilcast.pipeline.main import _build_session_sync
+    idx = pd.bdate_range("2026-09-14", "2026-09-18")
+    empty_intraday_db = types.SimpleNamespace(
+        read_intraday=lambda: pd.DataFrame(columns=["symbol", "source"]))
+    macro = pd.DataFrame(index=idx)
+    # night=None + day 仅海外（曾在 prem.dropna / pd.concat / _records 三处崩溃）
+    day = pd.DataFrame({"wti": 99. + np.arange(len(idx)),
+                        "brent": 103. + np.arange(len(idx))}, index=idx)
+    out = _build_session_sync(day, None, macro, None, empty_intraday_db)
+    assert out["available"] is True
+    assert out["premium_series"] == [] and out["anchor_night_records"] == []
+    assert len(out["anchor_day_records"]) == len(idx)
+    # day 完全空 / None → available=False 且给原因，不抛异常
+    assert _build_session_sync(pd.DataFrame(), None, macro, None, empty_intraday_db)["available"] is False
+    assert _build_session_sync(None, None, macro, None, empty_intraday_db)["available"] is False
+
+
 def test_intraday_fusion_only_shanghai_and_no_future():
     """同时刻融合只作用于上海原油：覆盖日把其跨市场 brent 换成 15:00 同时刻价；
     WTI 模型不被改动；且换入价不晚于上海收盘（无未来）。"""
@@ -963,8 +1012,8 @@ def test_detected_events_auto_expand_regimes():
     assert r.loc[idx[29], "hist_geo_regime"] < r.loc[idx[10], "hist_geo_regime"]
 
 
-def test_anchor_panel_updates_all_five_and_sc_roll():
-    """02:30 同时刻面板必须覆盖五品种（不止上海），上海再按换月复权因子校正。"""
+def test_anchor_panel_covers_provided_columns_and_sc_roll():
+    """apply_anchor_panel_to_prices 只覆盖面板里【实际提供】的列；上海按换月复权因子校正。"""
     from oilcast.features.intraday_align import apply_anchor_panel_to_prices
     idx = pd.bdate_range("2026-09-14", periods=5)
     cols = ["wti", "brent", "shanghai_crude", "heating_oil", "gasoil"]
@@ -978,7 +1027,7 @@ def test_anchor_panel_updates_all_five_and_sc_roll():
     }, index=idx)
     factor = pd.Series([np.nan, np.nan, np.nan, 0.9, 1.0], index=idx)
     out = apply_anchor_panel_to_prices(prices, panel, factor)
-    # 五品种在覆盖日都被更新（外盘同样切到 02:30 同刻，而非保留日收盘）
+    # 提供了五列→五列在覆盖日都更新（函数通用能力）
     for c in ["wti", "brent", "heating_oil", "gasoil"]:
         assert out[c].iloc[3] == panel[c].iloc[3]
     # 上海按复权因子缩放：800*0.9=720；最新日因子=1 保持真实价
@@ -986,3 +1035,23 @@ def test_anchor_panel_updates_all_five_and_sc_roll():
     assert abs(out["shanghai_crude"].iloc[4] - 734.8) < 1e-9
     # 面板缺失的更早交易日保持原值（不造数）
     assert (out.iloc[:3] == 100.0).all().all()
+
+
+def test_pipeline_anchor_only_overrides_shanghai_never_overseas():
+    """用户硬约束：02:30 分时窗口只对齐上海原油（亚洲品种，自 2026-06-03 起），
+    海外四品种十年全程维持交易所日 K 结算口径、绝不被该窗口改写（上海独立学习、不影响其他品种）。
+    pipeline 只把【上海一列】面板传给覆盖函数。"""
+    from oilcast.features.intraday_align import apply_anchor_panel_to_prices
+    idx = pd.bdate_range("2026-09-14", periods=5)
+    cols = ["wti", "brent", "shanghai_crude", "heating_oil", "gasoil"]
+    prices = pd.DataFrame(100.0, index=idx, columns=cols)
+    # pipeline 实际传入：只含上海列的 02:30 面板（外盘同刻价仅供上海建模/展示，不进全局 prices）
+    sc_panel = pd.DataFrame(
+        {"shanghai_crude": [np.nan, np.nan, np.nan, 720.0, 734.8]}, index=idx)
+    out = apply_anchor_panel_to_prices(prices, sc_panel, None)
+    # 海外四品种全程不变（十年日 K 口径不被打断）
+    for c in ["wti", "brent", "heating_oil", "gasoil"]:
+        assert (out[c] == 100.0).all(), f"{c} 不应被上海分时窗口改写"
+    # 上海在覆盖日更新、缺失日保持
+    assert out["shanghai_crude"].iloc[3] == 720.0 and out["shanghai_crude"].iloc[4] == 734.8
+    assert (out["shanghai_crude"].iloc[:3] == 100.0).all()
