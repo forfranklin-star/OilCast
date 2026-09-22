@@ -1,0 +1,18 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# 数据库与中间产物（每日由 Actions 重新生成；如需保留历史可取消下行注释）
+# data/*.db
+*.db-journal
+
+# 本机代理配置（可能含代理账号密码，仅存本机，不提交、不打包）
+data/proxy.json
+
+.DS_Store
+.idea/
+.vscode/
