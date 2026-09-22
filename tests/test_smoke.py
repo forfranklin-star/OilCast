@@ -961,6 +961,125 @@ def test_direction_layer_persists_across_pickle(tmp_path):
     assert ep2["dir_stance"] == ep1["dir_stance"]
 
 
+def test_recent_failure_circuit_breaker():
+    # 近端失效熔断单元判据：近期按表态稳定亏钱→关闭；近期有效→放行；样本不足→不熔断
+    rf = ShortTermForecaster._recent_failure
+    bad_sgn = [1] * 10                       # 一直看涨
+    bad_fwd = [-0.03 + 0.001 * (i % 3) for i in range(10)]  # 却持续下跌：稳定亏损
+    r_bad = rf(bad_sgn, bad_fwd, min_eng=6, max_p=0.30, ad=[0] * 10)
+    assert r_bad["recent_ok"] is False and r_bad["recent_reason"]
+    good_sgn = [1] * 10
+    good_fwd = [0.03 - 0.001 * (i % 3) for i in range(10)]
+    r_good = rf(good_sgn, good_fwd, 6, 0.30, ad=[1] * 10)
+    assert r_good["recent_ok"] is True
+    r_few = rf([1, -1], [0.02, -0.01], 6, 0.30, ad=[1, 0])
+    assert r_few["recent_ok"] is True and r_few["recent_engaged_n"] == 2
+    # 低胜率(40%)但高盈亏比、期望为正：ML 通道要求命中过半→关；趋势通道只看期望→放行
+    lo_sgn = [1] * 10
+    lo_fwd = [-0.01] * 6 + [0.03] * 4       # 6 次小亏 + 4 次大赚，均值为正、胜率 40%
+    lo_ad = [0] * 6 + [1] * 4
+    assert rf(lo_sgn, lo_fwd, 6, 0.30, ad=lo_ad, require_hit=True)["recent_ok"] is False
+    r_trend = rf(lo_sgn, lo_fwd, 6, 0.30, ad=None, require_hit=False)
+    assert r_trend["recent_ok"] is True and r_trend["recent_mean_ret"] > 0
+
+
+def test_gate_circuit_breaks_when_edge_reverses_recently():
+    # 长历史 ML edge 成立、但最近约一年信号系统性反向时，近端熔断必须关闭 edge（退回中性）；
+    # 全程有效时则照常放行。直接构造样本外点序列，确定性覆盖，不依赖联网/特征工程。
+    from oilcast.config import get_config
+    mcfg = get_config()["model"]
+    h = 5
+    rng = np.random.default_rng(0)
+
+    def g(base):  # 加小幅噪声避免常数序列 t 检验精度警告，符号与幅度不变
+        return base + float(rng.normal(0, 0.0015))
+
+    def good_up(): return (0.92, 1, g(0.025))    # 看涨概率高、实际上涨、按表态赚
+    def good_dn(): return (0.08, 0, g(-0.025))   # 看跌概率高、实际下跌、按表态赚
+    def rev_up(): return (0.92, 0, g(-0.03))     # 看涨却大跌（近端反转，亏）
+    def rev_dn(): return (0.08, 1, g(0.03))      # 看跌却大涨（近端反转，亏）
+
+    def panel(n_good, n_rev):
+        pts = []
+        for i in range(n_good):
+            pts.append(good_up() if rng.random() > 0.5 else good_dn())
+        for i in range(n_rev):
+            pts.append(rev_up() if rng.random() > 0.5 else rev_dn())
+        return {h: pts}
+
+    fc = ShortTermForecaster(h, compute_residuals=False, run_arima=False)
+    # 对照：全程 110 点有效 → edge 放行
+    fc._fit_direction_gate([h], panel(110, 0), mcfg, {}, np.nan)
+    assert fc.dir_edge[h]["has_edge"] is True, fc.dir_edge[h]
+    # 长历史 80 点有效、末 30 点（覆盖近端窗口）系统性反向 → 长历史成立但被近端熔断关闭
+    fc2 = ShortTermForecaster(h, compute_residuals=False, run_arima=False)
+    fc2._fit_direction_gate([h], panel(80, 30), mcfg, {}, np.nan)
+    e2 = fc2.dir_edge[h]
+    assert e2["ml_long_edge"] is True, f"长历史edge应成立: {e2}"
+    assert e2["ml_recent_ok"] is False and e2["has_edge"] is False, e2
+
+
+def test_backtest_circuit_breaks_on_late_regime_reversal(monkeypatch):
+    # 回测接线端到端：全程有效面板上，把【全样本探针】近端（回测窗口内）的样本外点翻转为
+    # "高置信却反向亏损"，模拟突发地缘反转后模型滞后、高置信逆势。逐原点近端确认必须熔断
+    # （recent_break_origins>0）、表态率显著下降。直接注入探针点以确定性锁定接线，不依赖
+    # 模型能否在合成数据上重新学出反向规律。
+    from oilcast.models import evaluation as ev
+    from oilcast.config import get_config
+    h = 10
+    X, price = _direction_panel(predictable=True, n=1500, h=h)
+    n = len(X)
+    k_break = max(get_config()["model"]["edge_recent_min_eng"],
+                  int(np.ceil(get_config()["model"]["edge_recent_span"] / h)))
+    orig_fit = ev.ShortTermForecaster.fit
+
+    def wrap_fit(self, Xf, pf=None, **kw):
+        out = orig_fit(self, Xf, pf, **kw)
+        if len(Xf) == n and getattr(self, "gate_pa_raw", None) and h in self.gate_pa_raw:
+            pts = list(self.gate_pa_raw[h])
+            for j in range(len(pts) - k_break, len(pts)):
+                i, rp, _ad, _fr = pts[j]
+                if rp >= 0.5:   # 模型看涨 → 实际下跌（逆势亏损）
+                    pts[j] = (i, rp, 0, -abs(_fr) - 0.01)
+                else:           # 模型看跌 → 实际上涨（逆势亏损）
+                    pts[j] = (i, rp, 1, abs(_fr) + 0.01)
+            self.gate_pa_raw[h] = pts
+        return out
+
+    monkeypatch.setattr(ev.ShortTermForecaster, "fit", wrap_fit)
+    bt = backtest_short(X, price, horizon=h, n_origins=12, gap=3,
+                        calib_origins=4, calib_iter=20, dir_origins=40)
+    assert bt["available"], bt
+    assert bt.get("long_edge_origins", 0) > 0, bt          # 长历史 edge 成立
+    assert bt.get("recent_break_origins", 0) > 0, bt       # 近端逆势被逐原点熔断
+    assert bt["stance_engagement_rate"] < 0.6, bt          # 多数原点退回中性
+
+
+def test_backtest_trains_through_origin_t(monkeypatch):
+    # 锁定 off-by-one 修复：每个回测原点 t 必须用含第 t 行的数据训练、喂第 t 行特征，
+    # actual 从 price[t] 起算（与生产 predict 同口径），旧实现止于 t-1 造成 1 日错位。
+    from oilcast.models import evaluation as ev
+    X, price = _direction_panel(predictable=True, n=1200)
+    horizon, n_origins, gap = 5, 12, 3
+    n = len(X)
+    origins = [t for t in range(n - horizon - n_origins * gap, n - horizon, gap) if t >= 260]
+    last_origin_date = X.index[origins[-1]]
+    seen = []
+
+    class Wrap(ev.ShortTermForecaster):
+        def fit(self, Xf, pf=None, **kw):
+            seen.append(Xf.index[-1])
+            return super().fit(Xf, pf, **kw)
+
+    monkeypatch.setattr(ev, "ShortTermForecaster", Wrap)
+    bt = backtest_short(X, price, horizon=horizon, n_origins=n_origins, gap=gap,
+                        calib_origins=4, calib_iter=20, dir_origins=20)
+    assert bt["available"], bt
+    # 旧 iloc[:t] 实现下，最后一个原点的训练末行只会是 t-1，绝不会出现 t 当日
+    assert last_origin_date in seen, (
+        f"回测原点 {last_origin_date.date()} 当日必须进入训练（含 t），实际末行集合未命中")
+
+
 # ---------------------------------------------------------------- 本轮修复回归
 def test_sc_dominant_continuous_removes_roll_gap():
     """持仓量主力 + 同合约比例复权：换月日收益必须等于新合约自身收益，而非跨合约假跳空。"""
