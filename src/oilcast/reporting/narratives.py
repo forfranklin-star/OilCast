@@ -265,9 +265,18 @@ def backtest_narrative(bt: dict) -> Optional[str]:
     # 三分类方向口径
     er = bt.get("stance_engagement_rate", 0)
     if er == 0:
-        dir_txt = (f"方向采用看涨/看跌/中性三分类：{bt['n_origins']} 个样本外原点上该周期方向"
-                   f"均未通过显著性门控、全部判中性（中性是弱有效市场下的诚实选择，不计为错误），"
-                   f"概率 Brier {bt.get('direction_brier', '-')}；")
+        nbreak = bt.get("recent_break_origins", 0)
+        if nbreak > 0:
+            dir_txt = (
+                f"方向采用看涨/看跌/中性三分类：{bt['n_origins']} 个样本外原点中，{nbreak} 个"
+                f"原点的长历史方向 edge 虽曾成立，但最近约一年样本外表态已转为稳定亏损或显著"
+                f"反向，被【近端失效熔断】自动退回中性，其余原点未通过显著性门控，故本期无明确"
+                f"方向表态（中性是弱有效市场下的诚实选择，不计为错误；这避免在地缘暴涨暴跌的"
+                f"反转行情里逆势硬猜），概率 Brier {bt.get('direction_brier', '-')}；")
+        else:
+            dir_txt = (f"方向采用看涨/看跌/中性三分类：{bt['n_origins']} 个样本外原点上该周期方向"
+                       f"均未通过显著性门控、全部判中性（中性是弱有效市场下的诚实选择，不计为错误），"
+                       f"概率 Brier {bt.get('direction_brier', '-')}；")
     else:
         acc = bt.get("stance_engaged_accuracy")
         p_txt = (f"，相对抛硬币的二项检验 p={bt.get('stance_engaged_p')}"
@@ -286,8 +295,9 @@ def backtest_narrative(bt: dict) -> Optional[str]:
                     f"同期无条件持有的平均收益 {bt.get('buyhold_mean_ret_pct', '-')}%（胜率与"
                     f"盈利能力分开考核）；")
     return (f"近期滚动回测（{span}{bt['n_origins']} 个样本外原点、{bt['horizon_td']} 交易日视野，"
-            f"每个原点均只用当时可得数据、按滚动训练窗拟合，门控只用回测起点之前数据，全程无未来"
-            f"泄漏）：幅度 MAE {bt['mae_pct']}%，{dir_txt}{econ_txt}预测与实际累计收益相关系数 "
+            f"每个原点均只用当时可得数据、按滚动训练窗拟合；方向门控逐原点滚动、仅引用当时已实现"
+            f"的样本外表现，并对最近约一年失效（稳定亏损或显著反向）的通道自动熔断退回中性，全程"
+            f"无未来泄漏）：幅度 MAE {bt['mae_pct']}%，{dir_txt}{econ_txt}预测与实际累计收益相关系数 "
             f"{bt.get('ic', 0):.2f}；随机游走基准误差 {bt['benchmark_mae_pct']}%，"
             f"本模型{cmp_word}{imp_txt}。全球定价的原油日度方向信噪比天然偏低、胜率长期围绕 50% "
             f"波动属正常，故系统同时考核胜率与经济价值，只在样本外显著（胜率或期望收益）时才明确"
