@@ -68,6 +68,7 @@ def get_config(path: str | os.PathLike | None = None) -> DictProxy:
         m["backtest_origins"] = 12
         m["resid_train_window"] = 300
         m["dir_gate_lookback"] = 200
+        m["edge_recent_span"] = 120
         m["dir_clf_max_iter"] = 30
 
     cfg = _deep_freeze(raw)
