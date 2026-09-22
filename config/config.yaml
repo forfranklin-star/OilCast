@@ -15,6 +15,14 @@ system:
     # 可识别的学术研究 UA（避免使用 "bot" 字样：部分政府/财经站点会直接丢弃该类请求）
     user_agent: "Mozilla/5.0 (compatible; OilCastResearch/1.0; academic; +https://github.com/your-name/oilcast)"
 
+  # 代理服务器与"信源不可达暂停换代理"（本地部署/桌面运行使用；CI 留空直连即可）
+  network:
+    proxy_url: ""              # 留空=直连；可填 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080
+                               # 运行期也可用 CLI --proxy、网页侧栏或 data/proxy.json 设置（优先级更高）
+    proxy_test_url: "https://www.google.com/generate_204"  # 代理连通性探测地址（轻量 204）
+    proxy_pause_enabled: "auto"  # auto=仅本地交互终端暂停、网页/CI 不阻塞；on=强制；off=关闭
+    proxy_pause_seconds: 60      # 信源网络层不可达时，暂停等待换代理的倒计时秒数；超时自动继续
+
 # ------------------------- 数据原则（最高优先级）----------------------
 # 只允许真实、可追溯、带观测日期的数据；任何缺失/过期/无法验证的数据一律保持
 #   缺失，禁止插值外推、禁止用合成值补齐；数据不足以建模时对应预测显式标注
