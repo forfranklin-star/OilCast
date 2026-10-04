@@ -1,1 +1,9 @@
+# 本地/云端 Streamlit 控制台配置
+[browser]
+# 关闭使用统计遥测
+gatherUsageStats = false
+
+[logger]
+# 隐藏启动时的官方欢迎/营销横幅（含 "streamlit skills" 推广语）
+hideWelcomeMessage = true
 
