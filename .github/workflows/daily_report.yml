@@ -15,7 +15,7 @@ name: daily-oil-report
 # =====================================================================
 on:
   schedule:
-    - cron: "0 1 * * *"
+    - cron: "5 1,9,17 * * *"
   workflow_dispatch:
 
 permissions:
