@@ -30,6 +30,7 @@ from oilcast.reporting.static_html import (HORIZON_CN, price_figure,
                                            scenario_figure, weights_figure,
                                            sensitivity_figure,
                                            relative_strength_figure,
+                                           spot_price_figure, basis_figure,
                                            report_history_coverage)
 
 st.set_page_config(page_title="多因素油价智能分析与预测系统", layout="wide", page_icon="🛢️")
@@ -119,7 +120,7 @@ with st.sidebar:
 
     # -------- 模型学习状态的导出（下载到本地）/ 导入（从本地上传恢复）--------
     st.divider()
-    st.markdown("**模型备份与恢复（持续学习不丢失）**")
+    st.markdown("**模型备份与恢复**")
     n_models = len(list_models())
     st.caption(f"当前已保存 {n_models} 个模型工件。快照含模型、版本链、因素权重、"
                "历史预测与报告索引，可下载到本地备份，或上传到另一套环境在原进度续学。")
@@ -277,8 +278,30 @@ with tab_s:
     else:
         st.warning(f"长期预测暂不可用：{item.get('reason','真实数据不可用') if item else '该品种无长期预测'}")
 
+# --------------------------------------------------------------- 现货与价差
+st.subheader("现货价格与期货-现货价差")
+if report.get("spots"):
+    _win = st.selectbox(
+        "显示时长", options=[63, 126, 252, 756, 1260],
+        format_func=lambda n: {63: "近3个月", 126: "近6个月", 252: "近1年",
+                               756: "近3年", 1260: "近5年"}[n],
+        index=2, key="spot_win")
+    st.plotly_chart(spot_price_figure(report, _win), use_container_width=True)
+    st.plotly_chart(basis_figure(report, _win), use_container_width=True)
+    _sn = report.get("spots_narr", {})
+    if _sn.get("available"):
+        _dub = f"、迪拜现货 {_sn['dubai_spot']}" if _sn.get("dubai_spot") is not None else ""
+        st.info(
+            f"截至 {_sn['date']}：WTI 现货 {_sn['wti_spot']}、布伦特现货 "
+            f"{_sn['brent_spot']}{_dub}；WTI 期现价差 {_sn['wti_basis']}"
+            f"（{_sn['wti_state']}），布伦特期现价差 {_sn['brent_basis']}"
+            f"（{_sn['brent_state']}）。价差为正=期货升水 contango，为负=期货贴水 "
+            f"backwardation（近端供给偏紧）。")
+else:
+    st.caption("现货数据暂不可用，保持空缺、不生成模拟值。")
+
 # --------------------------------------------------------------- 事件列表
-st.subheader("关键事件与量化影响（真实新闻）")
+st.subheader("关键事件与量化影响")
 ev = pd.DataFrame(report["events"])
 if not ev.empty:
     filt = st.radio("时间范围", ["一周", "一月"], horizontal=True)
@@ -477,5 +500,4 @@ for t in _target_order:
         st.write("**两周预测**：" + report["narratives"]["short"][t])
         st.write("**三个月预测**：" + report["narratives"]["mid"][t])
 
-st.caption(report["narratives"]["sources"] +
-           " ｜ 缺失、过期或无法验证的数据一律不补齐；预测不构成投资建议。")
+st.caption(report["narratives"]["sources"] + " ｜ 预测不构成投资建议。")

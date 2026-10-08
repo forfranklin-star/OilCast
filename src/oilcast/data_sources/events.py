@@ -25,9 +25,13 @@ THEME_KEYWORDS: Dict[str, List[str]] = {
                           "sanction", "embargo", "halt export", "voluntary cut", "supply cut"],
     "geopolitical_risk": ["red sea", "houthi", "attack", "strike", "war", "military",
                           "iran", "israel", "gaza", "ukraine", "russia", "tanker",
-                          "political unrest", "coup", "conflict", "escalat", "hormuz"],
+                          "political unrest", "coup", "conflict", "escalat", "hormuz",
+                          "invasion", "ceasefire", "peace deal", "nuclear", "territorial"],
     "demand_outlook": ["demand", "inventory", "stockpile", "iea", "slowdown",
-                       "refinery", "crude stock", "trade"],
+                       "refinery", "crude stock", "trade",
+                       # 重大公共卫生事件导致的需求冲击
+                       "lockdown", "pandemic", "covid", "coronavirus", "quarantine",
+                       "recession", "demand shock"],
     "cpi_surprise": ["cpi", "inflation", "consumer price"],
     "jobs_surprise": ["nonfarm", "payroll", "jobs report", "unemployment"],
     "fed_policy_expectation": ["fed", "rate cut", "rate hike", "fomc", "powell",
@@ -39,17 +43,27 @@ THEME_KEYWORDS: Dict[str, List[str]] = {
 ENERGY_HINT = ("oil", "crude", "opec", "brent", "wti", "petrol", "gasoline", "diesel",
                 "heating oil", "ulsd", "gasoil", "distillate",
                "refinery", "iran", "russia", "saudi", "energy", "barrel", "tanker",
-               "natural gas", "shale", "hormuz", "iea", "fuel")
+               "natural gas", "shale", "hormuz", "iea", "fuel",
+               # 产油地区/势力与油国基础设施专有词：标题未直接写 oil/saudi 时也应保留
+               "houthi", "yemen", "riyadh", "abha", "airport", "oil facility",
+               "pipeline", "oil terminal")
 # 利多 / 利空词强度（对油价方向）
 BULLISH = {"surge": 1.0, "soar": 1.0, "rally": 0.8, "jump": 0.7, "spike": 0.9,
            "disruption": 1.0, "attack": 0.9, "sanction": 0.9, "halt": 0.7,
            "cut supply": 1.0, "production cut": 1.0, "shortage": 0.9,
            "escalat": 0.8, "raise": 0.5, "upgrade": 0.6, "rate cut": 0.8,
-           "tighter": 0.6, "drop in export": 0.8, "craters": 0.8}
+           "tighter": 0.6, "drop in export": 0.8, "craters": 0.8,
+           # 武装袭击类（指向供给/地缘风险、对油价利多；strike 亦含罢工导致供给中断）
+           "strike": 0.8, "missile": 0.7, "drone": 0.6,
+           "invasion": 0.8, "nuclear": 0.6}
 BEARISH = {"plunge": 1.0, "slump": 0.9, "tumble": 0.9, "fall": 0.5, "drop": 0.4,
            "surplus": 0.8, "recession": 0.9, "weak demand": 1.0, "rate hike": 0.8,
            "downgrade": 0.7, "lower forecast": 0.9, "output raise": 0.9,
-           "pump more": 0.8, "ease supply": 0.6, "risk-off": 0.5}
+           "pump more": 0.8, "ease supply": 0.6, "risk-off": 0.5,
+           # 地缘风险溢价降温（停火/和平/降级）
+           "ceasefire": 0.7, "peace deal": 0.7, "de-escalat": 0.6,
+           # 重大公共卫生事件导致的需求骤降
+           "lockdown": 0.8, "pandemic": 0.6, "quarantine": 0.5}
 THEME_ELASTICITY = {
     "supply_disruption": 3.5, "geopolitical_risk": 3.0, "demand_outlook": 1.8,
     "cpi_surprise": 1.4, "jobs_surprise": 1.2, "fed_policy_expectation": 1.6,

@@ -45,6 +45,44 @@ GROUP_CN = {
 }
 
 
+def _logit(p: float) -> float:
+    p = min(max(float(p), 1e-6), 1 - 1e-6)
+    return float(np.log(p / (1 - p)))
+
+
+def _sigmoid(z: float) -> float:
+    return float(1 / (1 + np.exp(-z)))
+
+
+def event_weight(n_evt: float, n0: float = 5.0) -> float:
+    """事件证据置信权重：有效样本 n 越小越靠近 0（不表态），n 增大才趋近 1。"""
+    return float(n_evt / (n_evt + n0))
+
+
+def blend_event_prob(p_tech: float, p_evt: float, n_evt: float,
+                     tech_edge: bool, n0: float = 5.0) -> float:
+    """把【技术面方向概率】与【事件条件后验】在对数几率空间融合。
+
+    * 事件面：logit(p_evt) 本身已由 Beta 先验（1.5/1.5）在样本少时拉回 0.5，
+      再乘置信权重 n/(n+n0) 做第二重收缩，证据不足绝不会过度自信；
+    * 技术面：仅当样本外方向 edge 统计成立（tech_edge）才给全权重，否则权重为 0
+      （日频方向无 edge 时不让其噪声干扰事件证据）；
+    返回融合后的 P(涨)。平静期（无事件、n=0）权重为 0、技术又无 edge → 自然退回 0.5。
+    """
+    z_evt = _logit(p_evt) * event_weight(n_evt, n0)
+    z_tech = _logit(p_tech) if tech_edge else 0.0
+    return _sigmoid(z_evt + z_tech)
+
+
+def blend_event_move(pct_tech: float, exp_move_h5_pct: float, n_evt: float,
+                     horizon_decay: float = 0.5, n0: float = 5.0) -> float:
+    """点预测幅度融合：技术点预测 + 事件期望幅度×置信权重×期限衰减。
+
+    horizon_decay：事件 edge 集中在爆发后约 h=5，更长终点按此衰减（h5≈1、h10≈0.5）。
+    """
+    return float(pct_tech) + float(exp_move_h5_pct) * event_weight(n_evt, n0) * horizon_decay
+
+
 class EventShockModel:
     """逐 (分组 × 品种) 累积已实现冲击、给条件后验与当前冲击提示。"""
 

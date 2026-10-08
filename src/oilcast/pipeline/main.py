@@ -24,6 +24,7 @@ from .. import net
 from ..certfix import ensure_ca_bundle
 from ..config import get_config, ensure_dirs
 from ..data_sources.collector import collect
+from ..data_sources.spots import attach_basis
 from ..data_sources.calendar import (next_trading_days, closed_holiday_mmdd)
 from ..data_sources.intraday_client import collect_intraday
 from ..data_sources.sc_contracts import sc_adjustment_factor_by_date
@@ -66,10 +67,14 @@ def _path_records(path: pd.DataFrame) -> list:
 
 
 def _hist_records(prices: pd.DataFrame, n: int = 180) -> list:
-    # 最后防线：丢弃四标的全空的非交易日行（绝不把假日排成 NaN 视觉断点）
+    # 最后防线：丢弃全品种全空的非交易日行（绝不把假日排成视觉断点）
     p = prices.tail(n).dropna(how="all").copy()
     p.insert(0, "date", p.index.strftime("%Y-%m-%d"))
-    return p.where(pd.notnull(p), None).round(2).to_dict("records")
+    num = [c for c in prices.columns]
+    # 先 round 再转 object：object 列才能真正持有 None（float 列会把 None 转回 NaN，
+    # 进而被序列化成非法 NaN 而非 null，污染前端 JS）
+    p[num] = p[num].round(2).astype(object).where(p[num].notna(), None)
+    return p.to_dict("records")
 
 
 def _events_records(ev: pd.DataFrame, n: int = 30) -> list:
@@ -90,6 +95,55 @@ def _views_records(v: pd.DataFrame, n: int = 12) -> list:
             v[_c] = None
     v["date"] = pd.to_datetime(v["date"]).dt.strftime("%Y-%m-%d")
     return v.replace({np.nan: None}).to_dict("records")
+
+
+def _spots_records(spots: pd.DataFrame, n: int = 1320) -> list:
+    """现货与期现价差记录（最近 n 交易日）；date 字符串、NaN→None，绝不造数。"""
+    if spots is None or spots.empty:
+        return []
+    cols = ["wti_spot", "brent_spot", "dubai_spot", "wti_basis", "brent_basis"]
+    s = spots.reindex(columns=cols).tail(n).dropna(how="all").copy()
+    s.insert(0, "date", s.index.strftime("%Y-%m-%d"))
+    # object 列才能真正持有 None（float 列会把 None 转回 NaN、序列化成非法 NaN）
+    s[cols] = s[cols].round(3).astype(object).where(s[cols].notna(), None)
+    return s.to_dict("records")
+
+
+def _spots_narrative(spots: pd.DataFrame) -> dict:
+    """基于各品种自身最新真实观测生成解读（contango/backwardation）；无数据则 unavailable。
+
+    各品种发布时点不同（如迪拜可到 t 日、WTI/Brent 现货常滞后到 t-1），
+    不能绑一个全局最新日，否则滞后品种在该日被读成 None。
+    """
+    if spots is None or spots.empty:
+        return {"available": False}
+
+    def latest(c):
+        s = spots[c].dropna()
+        if not len(s):
+            return None, None
+        i = s.index.max()
+        return i.strftime("%Y-%m-%d"), round(float(s.loc[i]), 2)
+
+    def state(b):
+        if b is None:
+            return None
+        if b > 0:
+            return "期货升水contango"
+        if b < 0:
+            return "期货贴水backwardation，近端供给紧"
+        return "期现持平"
+
+    wd, wv = latest("wti_spot")
+    bd, bv = latest("brent_spot")
+    dd, dv = latest("dubai_spot")
+    _, wb = latest("wti_basis")
+    _, bbp = latest("brent_basis")
+    return {"available": True, "date": wd or bd,
+            "wti_spot": wv, "brent_spot": bv, "dubai_spot": dv,
+            "wti_basis": wb, "brent_basis": bbp,
+            "wti_state": state(wb), "brent_state": state(bbp),
+            "brent_date": bd, "dubai_date": dd}
 
 
 def future_index(last_date: pd.Timestamp, periods: int,
@@ -186,6 +240,9 @@ def _safeguard_report(report_date: str, prices: pd.DataFrame,
         "conditional_sensitivity": {},
         "holiday_impacts": {},
         "events": _events_records(bundle.events) if bundle is not None else [],
+        "spots": _spots_records(bundle.spots) if bundle is not None else [],
+        "spots_narr": _spots_narrative(bundle.spots) if bundle is not None else
+                      {"available": False},
         "views": _views_records(bundle.views) if bundle is not None else [],
         "backtest": {"status": "processing"},
         "model_learning": {"available": False},
@@ -244,6 +301,10 @@ def run(as_of: Optional[datetime] = None, require_prices: bool = False,
     db.save_views(bundle.views)
     db.save_lineage(report_date, bundle.lineage, bundle.mode)
     save_csv_snapshot(bundle.prices, bundle.macro, report_date)
+    # 现货（附加）：近月期货与现货按同一交易日对齐算 basis 后落库；独立于主期货口径
+    if bundle.spots is not None and len(bundle.spots):
+        bundle.spots = attach_basis(bundle.spots, bundle.prices)
+        db.save_spots(bundle.spots)
     prices, macro, events, views = bundle.prices, bundle.macro, bundle.events, bundle.views
 
     # 健壮性 + 热启动连续性：五品种列恒存在（本期彻底采不到的为全 NaN，按质量门 unavailable
@@ -629,6 +690,7 @@ def run(as_of: Optional[datetime] = None, require_prices: bool = False,
     if anchor and train_meta.get(anchor):
         calib_beta_h = train_meta[anchor].get("calib_beta_h")
     model_learning = {
+        "available": True,
         "retrained_at": now_beijing().strftime("%Y-%m-%d %H:%M:%S"),
         "rolling_window": int(mcfg["rolling_window"]),
         "train_window": int(mcfg.get("train_window", 500) or 0),
@@ -714,11 +776,38 @@ def run(as_of: Optional[datetime] = None, require_prices: bool = False,
     # 8b-3) 事件冲击条件效应（决策支持；不改动保守方向立场门控）
     #   热启动加载工件 → 用真机价格面板 + 重大事件年表，把已到期冲击的实际短窗反应并入
     #   （旧冲击时间衰减）→ 当前冲击提示 + 影子 OOS；状态存为工件，随 bundle 导入导出。
+    def _detected_as_major(df):
+        """把本次抓取、经规则核验的真实 RSS 事件映射为年表事件结构，
+        使 yaml 年表【尚未收录】的最新突发事件（如沙特双机场遇袭）也能进入事件条件融合。
+        只纳入强、方向明确的类别；普通需求/宏观新闻不映射，避免噪音。"""
+        import re
+        out = []
+        if df is None or not len(df):
+            return out
+        for _, r in df.iterrows():
+            th = str(r.get("theme", ""))
+            title = str(r.get("title", "")).lower()
+            cat, cs = None, False
+            if th == "geopolitical_risk":
+                cat = "geopolitical"
+                # 伊朗/霍尔木兹/胡塞/沙特等正是扰动对华中东供油链路的事件（上海 INE 特异）
+                cs = bool(re.search(r"iran|hormuz|tanker|houthi|yemen|saudi", title))
+            elif th == "supply_disruption":
+                cat = "supply_policy"
+            elif th == "demand_outlook" and re.search(
+                    r"lockdown|pandemic|covid|quarantine|recession", title):
+                cat = "demand_shock"
+            if cat:
+                out.append({"start": str(r["date"])[:10], "category": cat,
+                            "china_supply": cs, "phases": [],
+                            "title": r.get("title"), "source": "rule-verified RSS"})
+        return out
+
     event_shock = {"available": False}
     try:
         from ..models.event_shock import EventShockModel
         from ..features.engineering import _load_major_events as _lme
-        _major = _lme() or []
+        _major = list(_lme() or []) + _detected_as_major(detected_events)
         _blob = None
         if persist_on:
             _obj, _ = load_artifact("event_shock", "all")
@@ -740,6 +829,45 @@ def run(as_of: Optional[datetime] = None, require_prices: bool = False,
         LOG.warning("事件冲击条件效应模块降级：%s", exc)
         event_shock = {"available": False,
                        "reason": f"{type(exc).__name__}: {exc}"}
+
+    # 事件条件方向融合：仅作用于【短期】终点（事件 edge 集中在爆发后约 h=5）。
+    # 平静期（该品种无 alert）不改动任何字段，维持技术门控结果。
+    if event_shock.get("available"):
+        from ..models.event_shock import blend_event_prob, blend_event_move
+        _alerts = event_shock.get("alerts") or []
+        _thr = float(event_shock.get("thr", 0.62))
+        for _t, _short in short_out.items():
+            if _short.get("status") != "ok":
+                continue
+            _at = [a for a in _alerts if a.get("instrument") == _t]
+            if not _at:
+                continue
+            # 当前主导事件：取方向最偏离 0.5 的条件提示
+            _a = max(_at, key=lambda a: abs(float(a["p_up"]) - 0.5))
+            _ep = _short["endpoint"]
+            _p = blend_event_prob(float(_ep["prob_up"]), float(_a["p_up"]),
+                                  float(_a["n_evidence"]), bool(_ep.get("dir_has_edge")))
+            _lastpx = float(_ep["mean"]) / (1 + float(_ep["pct_mean"]) / 100.0)
+            _pct = blend_event_move(float(_ep["pct_mean"]),
+                                    float(_a["exp_move_pct"]),
+                                    float(_a["n_evidence"]), horizon_decay=0.5)
+            if _p >= _thr:
+                _stance = "事件条件看涨"
+            elif _p <= 1 - _thr:
+                _stance = "事件条件看跌"
+            else:
+                _stance = _ep.get("dir_stance", "中性")
+            _ep["prob_up"] = round(_p, 3)
+            _ep["prob_down"] = round(1 - _p, 3)
+            _ep["pct_mean"] = round(_pct, 2)
+            _ep["mean"] = round(_lastpx * (1 + _pct / 100.0), 2)
+            _ep["dir_stance"] = _stance
+            _ep["event_condition"] = {
+                "group_cn": _a["group_cn"], "onset": _a["onset"],
+                "n": int(_a["n_evidence"]), "p_evt": _a["p_up"],
+                "exp_h5_pct": _a["exp_move_pct"], "age": _a["days_since"]}
+            LOG.info("短期事件条件融合(%s)：p=%s stance=%s n=%s",
+                     _t, _ep["prob_up"], _stance, _a["n_evidence"])
 
     # 报告"关键事件"用跨天累积集合（库内历史 + 本次，去重），按日期降序取最近 120 条：
     # 这样页面"一周/一月"切换有真实区别；即使本次抓取只含最新一天，也能看到近一月事件。
@@ -767,6 +895,8 @@ def run(as_of: Optional[datetime] = None, require_prices: bool = False,
         "conditional_sensitivity": cond_sens,
         "holiday_impacts": holiday_impacts,
         "events": _events_records(report_events, n=120),
+        "spots": _spots_records(bundle.spots),
+        "spots_narr": _spots_narrative(bundle.spots),
         "views": _views_records(views),
         "backtest": bt,
         "model_learning": model_learning,

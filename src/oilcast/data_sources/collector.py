@@ -13,6 +13,7 @@ from . import events as ev_mod
 from . import institutional as inst_mod
 from . import macro as macro_mod
 from . import prices as price_mod
+from . import spots as spots_mod
 from .base import DataBundle
 from .calendar import observed_trading_index
 from .quality import FieldLineage, assess_daily, assess_monthly
@@ -212,8 +213,23 @@ def collect_strict(as_of: pd.Timestamp) -> DataBundle:
 
     prices = prices.loc[prices.index <= as_of]
     macro = macro.loc[macro.index <= as_of]
-    return DataBundle(prices, macro, events, views, lineage=lineage,
-                      vintage=vintage, mode="strict")
+
+    # 6) 现货（附加，独立索引、不与主期货口径混合）：WTI/布伦特日度现货 + 迪拜(仅本地)
+    sgot = run_with_timeout(spots_mod.fetch_spots, (as_of,), timeout_sec=300)
+    spot_df = sgot[0] if sgot else pd.DataFrame()
+    if len(spot_df):
+        spot_df = spot_df.loc[spot_df.index <= as_of]
+        for _c, _disp in (("wti_spot", "WTI原油现货"),
+                          ("brent_spot", "布伦特原油现货"),
+                          ("dubai_spot", "迪拜原油现货(仅本地)")):
+            lineage[_c] = assess_daily(
+                _c, _disp, spot_df.get(_c), as_of,
+                "OilPriceAPI/FRED" if _c != "dubai_spot" else "OilPriceAPI", "",
+                dict(qg["price_daily"]),
+                note="附加现货序列，不与主期货口径混合；缺日保留NaN").to_dict()
+
+    return DataBundle(prices, macro, events, views, spots=spot_df,
+                      lineage=lineage, vintage=vintage, mode="strict")
 
 
 def collect(as_of: Optional[datetime] = None, **_ignored) -> DataBundle:

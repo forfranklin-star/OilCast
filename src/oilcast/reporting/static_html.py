@@ -384,6 +384,47 @@ def session_premium_figure(report: dict) -> Optional[go.Figure]:
     return fig
 
 
+def _spot_window(report: dict, n: int) -> list:
+    recs = report.get("spots", [])
+    return recs[-n:] if n else recs
+
+
+def spot_price_figure(report: dict, n: int = 252) -> go.Figure:
+    """现货价格走势（WTI/布伦特/迪拜）；某品种窗口内无真实点则不绘制该线。"""
+    d = _spot_window(report, n)
+    x = [r["date"] for r in d]
+    fig = go.Figure()
+    for c, name, color in (("wti_spot", "WTI现货", "#1f6feb"),
+                           ("brent_spot", "布伦特现货", "#2e7d32"),
+                           ("dubai_spot", "迪拜现货", "#d18b1f")):
+        y = [r.get(c) for r in d]
+        if any(v is not None for v in y):
+            fig.add_trace(go.Scatter(x=x, y=y, name=name, connectgaps=False,
+                                     line=dict(color=color, width=1.8)))
+    fig.update_layout(height=380, margin=dict(t=12, r=12), yaxis_title="美元/桶",
+                      legend=dict(orientation="h", y=1.09),
+                      plot_bgcolor="white", hovermode="x unified")
+    return fig
+
+
+def basis_figure(report: dict, n: int = 252) -> go.Figure:
+    """期货-现货价差（近月期货 − 现货，WTI/布伦特）；缺日不连线。"""
+    d = _spot_window(report, n)
+    x = [r["date"] for r in d]
+    fig = go.Figure()
+    for c, name, color in (("wti_basis", "WTI 期货-现货", "#1f6feb"),
+                           ("brent_basis", "布伦特 期货-现货", "#b03434")):
+        y = [r.get(c) for r in d]
+        if any(v is not None for v in y):
+            fig.add_trace(go.Scatter(x=x, y=y, name=name, connectgaps=False,
+                                     line=dict(color=color, width=1.8)))
+    fig.update_layout(height=320, margin=dict(t=12, r=12),
+                      yaxis=dict(title="美元/桶", zeroline=True, zerolinecolor="#999"),
+                      legend=dict(orientation="h", y=1.14),
+                      plot_bgcolor="white", hovermode="x unified")
+    return fig
+
+
 def scenario_figure(report: dict, target: str = "wti") -> Optional[go.Figure]:
     item = report["forecasts"]["long"].get(target)
     if not _is_ok(item):
@@ -460,6 +501,7 @@ def render_static_html(report: dict) -> str:
     return Template(TEMPLATE).render(
         report=report, FACTOR_CN=FACTOR_CN, targets=targets,
         figs_json=json.dumps(figs, ensure_ascii=False),
+        spots_json=json.dumps(report.get("spots", []), ensure_ascii=False),
         cards=_cards(report), lineage_rows=_lineage_rows(report), plotly_src=plotly_src)
 
 
@@ -540,6 +582,7 @@ TEMPLATE = r"""
 
  <div class="navgroup">价格与对齐</div>
  <a href="#sec-prices">走势与预测区间</a>
+ <a href="#sec-spots">现货与期现价差</a>
  <a href="#sec-session">同时刻对齐（盘中）</a>
  <a href="#sec-endpoints">预测端点一览</a>
 
@@ -555,7 +598,7 @@ TEMPLATE = r"""
 
  <div class="navgroup">解读</div>
  <a href="#sec-narr">文字解读</a>
- <a href="#sec-disclaimer">数据原则与声明</a>
+ <a href="#sec-disclaimer">免责声明</a>
 
  {% set cnt = namespace(ok=0, bad=0) %}
  {% for t in targets %}
@@ -640,6 +683,38 @@ TEMPLATE = r"""
  {% for t in targets %}
  <div class="card" id="fig_price_{{ t }}" {% if not loop.first %}style="margin-top:16px"{% endif %}></div>
  {% endfor %}
+
+ <h2 id="sec-spots">现货价格与期货-现货价差</h2>
+ <div class="card">
+  <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
+   <span style="font-size:14px;color:var(--mut)">显示时长</span>
+   <select id="spot_win" onchange="redrawSpots()"
+     style="padding:5px 10px;border-radius:8px;border:1px solid #ccd6e0">
+    <option value="63">近3个月</option>
+    <option value="126">近6个月</option>
+    <option value="252" selected>近1年</option>
+    <option value="756">近3年</option>
+    <option value="1260">近5年</option>
+   </select>
+  </div>
+  <h3 style="font-size:15px;margin:10px 0 4px">现货价格走势（美元/桶）</h3>
+  <div id="fig_spots" style="height:380px"></div>
+  <h3 style="font-size:15px;margin:16px 0 4px">期货-现货价差（近月期货 − 现货，美元/桶）</h3>
+  <div id="fig_basis" style="height:320px"></div>
+  {% set sn = report.spots_narr %}
+  {% if sn and sn.available %}
+  <p class="narr" style="margin-top:12px">
+   截至 {{ sn.date }}：WTI 现货 {{ sn.wti_spot }}、布伦特现货 {{ sn.brent_spot }}
+   {% if sn.dubai_spot is not none %}、迪拜现货 {{ sn.dubai_spot }}{% endif %}；
+   WTI 期现价差 {{ sn.wti_basis }}（{{ sn.wti_state }}），
+   布伦特期现价差 {{ sn.brent_basis }}（{{ sn.brent_state }}）。
+   价差为正表示期货升水 contango（通常对应远端供给宽松/含库存与资金成本），为负表示期货贴水
+   backwardation（通常对应近端供给偏紧）。
+  </p>
+  {% else %}
+  <p class="mut" style="margin-top:12px">现货数据暂不可用，保持空缺、不生成模拟值。</p>
+  {% endif %}
+ </div>
 
  {% set ss = report.session_sync %}
  {% if ss and ss.available %}
@@ -762,6 +837,7 @@ TEMPLATE = r"""
  {% set ml = report.model_learning %}
  <h2 id="sec-learning">模型学习、回测与预测复盘（每日用最新真实数据重训并复测）</h2>
  {% if report.narratives.learning %}<div class="narr">{{ report.narratives.learning }}</div>{% endif %}
+ {% if ml.available %}
  <div class="card">
    <div class="kv"><span>本期重训时刻（北京时间）</span><b>{{ ml.retrained_at }}</b></div>
    <div class="kv"><span>短期模型滚动训练窗 / 累计运行期数</span><b>最近 {{ ml.train_window }} 个交易日（每日滑动重拟合）｜ 第 {{ ml.n_runs }} 期</b></div>
@@ -773,8 +849,8 @@ TEMPLATE = r"""
    {% endfor %}
    {% if ml.persistence and ml.persistence.enabled %}
    {% for t, e in ml.persistence.models.items() %}
-   <div class="kv"><span>{{ report.names[t] }}模型版本 / 学习方式</span>
-     <b>v{{ e.version }}｜500 交易日滚动窗每日整体重拟合以适配最新市场 regime；跨市场特征按各品种真实收盘时刻做 as-of 时点对齐（上海 INE 约 UTC07 收盘、WTI/Brent 等约 UTC21，上海在 t 日只取已落定的 t-1 海外行情、绝不使用其收盘后才产生的价格，消除时区错配与隐性未来函数），并在分时覆盖窗口把上海的自身收盘价与跨市场价统一对齐到北京 02:30 夜盘收盘这一真实时刻（上海连续交易的真正收盘＝统计主节点，周五夜盘物理在周六凌晨、归属周五；见"同一真实时刻"面板，15:00 日盘仅作对照，更早日期维持 as-of，两种口径标注不混用）；已纳入可审计重大事件 regime（新冠疫情、俄乌战争、红海危机、2026 美以伊战事，年表 data/reference/major_events.yaml，带来源、权重随滚动窗动态调整）与样本外 β 校准（无方向信号时自动退守随机游走）；误差结构（残差分位/波动/β）{% if e.warm_started %}继承自 v{{ e.parent_version }}（上期截止 {{ e.parent_train_end or '—' }}）、跨期 EMA 累积{% else %}本期初始化、下期起跨期继承{% endif %}；原始数据库持续累积、工件可导入导出，重启不丢学习资产</b></div>
+   <div class="kv"><span>{{ report.names[t] }}模型版本</span>
+     <b>v{{ e.version }}{% if e.warm_started %}（继承 v{{ e.parent_version }}，上期截止 {{ e.parent_train_end or '—' }}）{% else %}（本期初始化）{% endif %}</b></div>
    {% endfor %}
    {% endif %}
  </div>
@@ -845,6 +921,9 @@ TEMPLATE = r"""
    </table>
  </div>
  {% endif %}
+ {% else %}
+ <div class="card"><p class="mut">模型训练与回测进行中，完成后本板块将由完整报告自动覆盖。</p></div>
+ {% endif %}
 
  {% set ll = report.learning_loop %}
  {% if ll and ll.available %}
@@ -856,10 +935,12 @@ TEMPLATE = r"""
      {% set item = ll.multi[inst] %}
      {% if item and item.status == 'ok' %}
      {% for h in [5,10,21] %}
-     {% set c = item.cards[h] %}
+     {% set c = item.cards.get(h) or item.cards.get(h|string) %}
+     {% if c %}
      <tr><td>{{ report.names[inst] }}</td><td>{{ h }} 交易日</td><td>{{ c.target_date }}</td>
        <td>{{ c.stance }}</td><td>{{ c.prob_up }}</td><td>{{ c.mean }}</td>
        <td>{{ c.q05 }} ~ {{ c.q95 }}</td><td>{{ c.hazard }}</td><td>{{ c.pct_mean }}%</td></tr>
+     {% endif %}
      {% endfor %}
      {% endif %}
      {% endfor %}
@@ -881,7 +962,7 @@ TEMPLATE = r"""
  </div>
  {% endif %}
 
- <h2 id="sec-events">近期关键事件与量化影响（真实新闻，规则打分）</h2>
+ <h2 id="sec-events">近期关键事件与量化影响</h2>
  <div class="card">
  {% if report.events %}
  <table>
@@ -966,12 +1047,9 @@ TEMPLATE = r"""
  {% endfor %}
  {% if report.narratives.backtest %}<div class="narr">{{ report.narratives.backtest }}</div>{% endif %}
 
- <h2 id="sec-disclaimer">数据原则与免责声明</h2>
+ <h2 id="sec-disclaimer">免责声明</h2>
  <div class="card">
    <p class="mut">{{ report.narratives.sources }}</p>
-   <p class="mut"><b>数据原则：</b>模型只建立在真实、可追溯、带观测日期的数据之上；
-   缺失、过期或无法验证的数据一律保持缺失并在谱系表标明状态，绝不用插值、外推或合成值"补齐"。
-   月频指标在两次发布之间沿用最近一次真实发布值，并在底层数据中保留其原始发布日期（vintage）。</p>
    <p class="mut">模型包括 Direct 多步梯度提升（短期）、VAR 向量自回归（中期）与情景蒙特卡洛（长期），
    权重由随机森林与 LASSO 融合、向人工先验收缩并跨日 EMA 自适应。预测区间反映历史波动与模型不确定性，
    不构成任何投资建议；第三方数据版权归原方所有。</p>
@@ -983,6 +1061,40 @@ const FIGS = {{ figs_json | safe }};
 for (const [id, fig] of Object.entries(FIGS)) {
   if (fig) Plotly.newPlot(id, fig.data, fig.layout, {responsive:true, displaylogo:false});
 }
+// 现货与期现价差：原始数据注入，按所选时长窗口重绘（横轴交易日、缺日不留空线）
+const SPOTS = {{ spots_json | safe }};
+function tail(n){ return SPOTS.slice(Math.max(0, SPOTS.length - n)); }
+function hasAny(d,c){ return d.some(r => Number.isFinite(r[c])); }
+function lineTrace(d,c,name,color){
+  return {x:d.map(r=>r.date), y:d.map(r=>r[c]), name, mode:'lines',
+          type:'scatter', connectgaps:false, line:{color,width:1.8}};
+}
+function drawSpots(n){
+  const d = tail(n);
+  const defs = [['wti_spot','WTI现货','#1f6feb'],
+                ['brent_spot','布伦特现货','#2e7d32'],
+                ['dubai_spot','迪拜现货','#d18b1f']];
+  const traces = defs.filter(z=>hasAny(d,z[0])).map(z=>lineTrace(d,z[0],z[1],z[2]));
+  Plotly.newPlot('fig_spots', traces,
+    {margin:{t:12,r:12,b:30,l:52}, yaxis:{title:'美元/桶'},
+     legend:{orientation:'h',y:1.12}},
+    {responsive:true, displaylogo:false});
+}
+function drawBasis(n){
+  const d = tail(n);
+  const defs = [['wti_basis','WTI 期货-现货','#1f6feb'],
+                ['brent_basis','布伦特 期货-现货','#b03434']];
+  const traces = defs.filter(z=>hasAny(d,z[0])).map(z=>lineTrace(d,z[0],z[1],z[2]));
+  Plotly.newPlot('fig_basis', traces,
+    {margin:{t:12,r:12,b:30,l:52}, yaxis:{title:'美元/桶',zeroline:true},
+     legend:{orientation:'h',y:1.2}},
+    {responsive:true, displaylogo:false});
+}
+function redrawSpots(){
+  const n = parseInt(document.getElementById('spot_win').value, 10);
+  drawSpots(n); drawBasis(n);
+}
+if (SPOTS.length) redrawSpots();
 </script>
 </body></html>
 """

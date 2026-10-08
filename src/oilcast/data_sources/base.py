@@ -28,6 +28,8 @@ class DataBundle:
     macro: pd.DataFrame
     events: pd.DataFrame
     views: pd.DataFrame
+    # 现货（附加，不与主期货口径混合）：列 wti_spot/brent_spot/dubai_spot
+    spots: pd.DataFrame = field(default_factory=pd.DataFrame)
     lineage: Dict[str, dict] = field(default_factory=dict)
     vintage: Dict[str, pd.Series] = field(default_factory=dict)
     mode: str = "strict"

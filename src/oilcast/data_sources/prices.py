@@ -24,6 +24,53 @@ LOG = get_logger(__name__)
 
 
 # ----------------------------------------------------------- yfinance 备份
+import threading
+import time
+
+
+class _YfThrottle:
+    """两次【真实】yfinance 网络请求之间的最小间隔，串行节流、避免高频触发 429。"""
+    def __init__(self, gap: float = 2.0):
+        self.gap, self._last, self._lock = gap, 0.0, threading.Lock()
+
+    def wait(self) -> None:
+        with self._lock:
+            d = time.monotonic() - self._last
+            if d < self.gap:
+                time.sleep(self.gap - d)
+            self._last = time.monotonic()
+
+
+_yf_throttle = _YfThrottle(gap=2.0)
+
+
+def _yf_cache_path(ticker: str):
+    safe = "".join(ch if ch.isalnum() else "_" for ch in ticker)
+    d = _project_root() / "data" / "cache" / "yf"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"{safe}.csv"
+
+
+def _read_yf_cache(ticker: str) -> Optional[pd.Series]:
+    """读 yfinance 已下载序列的本地真实副本（可追溯，非合成）。"""
+    p = _yf_cache_path(ticker)
+    if not p.exists():
+        return None
+    try:
+        s = pd.read_csv(p, index_col=0, parse_dates=True).iloc[:, 0]
+        s.index = pd.to_datetime(s.index).normalize()
+        return pd.to_numeric(s, errors="coerce").dropna().sort_index()
+    except Exception:
+        return None
+
+
+def _write_yf_cache(ticker: str, s: pd.Series) -> None:
+    try:
+        pd.DataFrame({ticker: s}).to_csv(_yf_cache_path(ticker))
+    except Exception as exc:
+        LOG.warning("yfinance 缓存写入失败 %s：%s", ticker, exc)
+
+
 def _download_one(ticker: str, start: datetime, end: datetime) -> Optional[pd.Series]:
     # Windows 中文安装路径下，先把 CA 束指到纯 ASCII 路径，规避 libcurl curl(77)。
     try:
@@ -36,9 +83,11 @@ def _download_one(ticker: str, start: datetime, end: datetime) -> Optional[pd.Se
     # 显式传标准 requests.Session：yfinance 默认的 curl_cffi(libcurl) 在含中文路径下
     # 加载 certifi 失败(curl 77)；requests 用 Python open() 读 CA，不受路径字符集影响。
     sess = requests.Session()
+    _yf_throttle.wait()   # 串行节流：与上一次真实请求至少间隔 2s
     df = yf.download(ticker, start=pd.Timestamp(start).strftime("%Y-%m-%d"),
                      end=(pd.Timestamp(end) + timedelta(days=1)).strftime("%Y-%m-%d"),
-                     progress=False, auto_adjust=True, threads=False, session=sess)
+                     progress=False, auto_adjust=True, threads=False, session=sess,
+                     timeout=20)
     if df is None or df.empty:
         return None
     close = df["Close"]
@@ -50,16 +99,55 @@ def _download_one(ticker: str, start: datetime, end: datetime) -> Optional[pd.Se
 
 
 def fetch_yf_series(ticker: str, start: datetime, end: datetime) -> Optional[pd.Series]:
+    """带磁盘增量缓存的 yfinance 拉取：
+    - 请求区间已被缓存完整覆盖 -> 直接返回，【不发请求】；
+    - 否则只增量拉取缓存末尾之后的新数据（必要时向前补早段），合并写回缓存。
+    显著减少重复请求与数据量，配合节流降低 429 概率。缓存为真实下载副本，可追溯。"""
     try:
         import yfinance  # noqa: F401
     except ImportError:
         return None
-    try:
-        # yfinance 仅为末位兜底（Yahoo 403/限频时几乎必失败），12s 足够，避免每品种白等 20s
-        return run_with_timeout(_download_one, (ticker, start, end), timeout_sec=12)
-    except Exception as exc:
-        LOG.warning("yfinance %s 失败：%s", ticker, exc)
+    s0 = pd.Timestamp(start).normalize()
+    e0 = pd.Timestamp(end).normalize()
+    cached = _read_yf_cache(ticker)
+
+    def _cut(s: pd.Series) -> Optional[pd.Series]:
+        s = s[(s.index >= s0) & (s.index <= e0)]
+        return s.rename(ticker) if len(s) else None
+
+    # 完整命中：零请求
+    if cached is not None and cached.index.min() <= s0 and cached.index.max() >= e0:
+        return _cut(cached)
+
+    pieces: List[pd.Series] = []
+    # 向后增量（最常见：只拉最近未缓存的几天）
+    back_start = s0 if cached is None else (cached.index.max() + timedelta(days=1))
+    if cached is None or back_start <= e0:
+        try:
+            new = run_with_timeout(_download_one, (ticker, back_start, e0),
+                                   timeout_sec=25)
+        except Exception as exc:
+            LOG.warning("yfinance %s 增量失败：%s", ticker, exc)
+            new = None
+        if new is not None and len(new):
+            pieces.append(new)
+    # 向前补早段（罕见：缓存起点晚于请求起点）
+    if cached is not None and cached.index.min() > s0:
+        try:
+            pre = run_with_timeout(_download_one, (ticker, s0,
+                           cached.index.min() - timedelta(days=1)), timeout_sec=25)
+        except Exception as exc:
+            LOG.warning("yfinance %s 前置补取失败：%s", ticker, exc)
+            pre = None
+        if pre is not None and len(pre):
+            pieces.append(pre)
+    if cached is not None:
+        pieces.append(cached)
+    if not pieces:
         return None
+    full = pd.concat(pieces).groupby(level=0).last().sort_index()
+    _write_yf_cache(ticker, full)
+    return _cut(full)
 
 
 def _load_eia_key() -> Optional[str]:

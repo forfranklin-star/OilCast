@@ -223,18 +223,7 @@ def learning_narrative(ml: dict) -> str:
                    f"方向命中 {sm['dir_acc']}%、95%区间覆盖 {sm['coverage95']}%，误差反馈到下一期重训")
     else:
         seg.append("历史预测从下一期起陆续到期并纳入复测")
-    pers = ml.get("persistence", {})
-    if pers.get("enabled"):
-        cn = {"wti": "WTI原油", "brent": "布伦特原油",
-              "shanghai_crude": "上海原油", "heating_oil": "美燃油", "gasoil": "伦敦柴油"}
-        mods = pers.get("models", {})
-        warm = [cn.get(t, t) for t, e in mods.items() if e.get("warm_started")]
-        if warm:
-            seg.append("、".join(warm) +
-                       "在已保存的上期模型工件上热启动、增量训练（进程重启也不从零），本期工件已落盘并推进版本")
-        elif mods:
-            seg.append("本期为冷启动训练，模型工件已落盘，此后每期在上期基础上热启动持续学习")
-    return "；".join(seg) + "。权重每日向新数据学习并与上期平滑，全过程仅使用真实观测。"
+    return "；".join(seg) + "。"
 def _stance_txt(bt: dict) -> str:
     """三分类方向口径的一句话总结（看涨/看跌/中性，中性不计错）。"""
     er = bt.get("stance_engagement_rate")

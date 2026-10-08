@@ -51,6 +51,11 @@ CREATE TABLE IF NOT EXISTS reports (
 CREATE TABLE IF NOT EXISTS raw_intraday (
     symbol TEXT, ts TEXT, open REAL, high REAL, low REAL, close REAL,
     volume REAL, source TEXT, PRIMARY KEY(symbol, ts));
+-- 现货与"期货-现货价差"（附加板块）：现货 wti/brent/dubai；basis=近月期货-现货。
+-- 迪拜无挂牌期货，故无 dubai_basis。主键 date，幂等累积、NULL 不覆盖已有真实值。
+CREATE TABLE IF NOT EXISTS spot_prices (
+    date TEXT PRIMARY KEY, wti_spot REAL, brent_spot REAL, dubai_spot REAL,
+    wti_basis REAL, brent_basis REAL);
 """
 
 
@@ -164,6 +169,33 @@ class OilCastDB:
             df = pd.read_sql_query(
                 f"SELECT date,{','.join(cols)} FROM raw_prices WHERE mode=? ORDER BY date",
                 con, params=(mode,))
+        if df.empty:
+            return pd.DataFrame(columns=cols)
+        df["date"] = pd.to_datetime(df["date"])
+        return df.set_index("date").sort_index()
+
+    def save_spots(self, df: pd.DataFrame) -> None:
+        """幂等写入现货与期现价差；新值为 NULL 时不覆盖库内已有真实值（COALESCE）。"""
+        cols = ["wti_spot", "brent_spot", "dubai_spot", "wti_basis", "brent_basis"]
+        if df is None or df.empty:
+            return
+        out = df.reindex(columns=cols).copy()
+        out.index.name = "date"
+        out = out.reset_index()
+        out["date"] = pd.to_datetime(out["date"]).dt.strftime("%Y-%m-%d")
+        allc = list(out.columns)
+        update = ", ".join(f"{c}=COALESCE(excluded.{c},spot_prices.{c})" for c in cols)
+        sql = (f"INSERT INTO spot_prices ({','.join(allc)}) VALUES ({','.join('?' * len(allc))}) "
+               f"ON CONFLICT(date) DO UPDATE SET {update}")
+        with self._conn() as con:
+            con.executemany(sql, out.where(pd.notna(out), None).values.tolist())
+
+    def read_spots(self) -> pd.DataFrame:
+        """读出全部现货与期现价差（DatetimeIndex）；空库返回带列名的空表。"""
+        cols = ["wti_spot", "brent_spot", "dubai_spot", "wti_basis", "brent_basis"]
+        with self._conn() as con:
+            df = pd.read_sql_query(
+                f"SELECT date,{','.join(cols)} FROM spot_prices ORDER BY date", con)
         if df.empty:
             return pd.DataFrame(columns=cols)
         df["date"] = pd.to_datetime(df["date"])
