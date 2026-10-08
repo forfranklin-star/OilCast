@@ -741,6 +741,14 @@ def run(as_of: Optional[datetime] = None, require_prices: bool = False,
         event_shock = {"available": False,
                        "reason": f"{type(exc).__name__}: {exc}"}
 
+    # 报告"关键事件"用跨天累积集合（库内历史 + 本次，去重），按日期降序取最近 120 条：
+    # 这样页面"一周/一月"切换有真实区别；即使本次抓取只含最新一天，也能看到近一月事件。
+    if detected_events is not None:
+        report_events = (detected_events.sort_values("date", ascending=False)
+                         .reset_index(drop=True))
+    else:
+        report_events = events
+
     report = {
         "report_date": report_date,
         "generated_at": now_beijing().strftime("%Y-%m-%d %H:%M:%S %z"),
@@ -758,7 +766,7 @@ def run(as_of: Optional[datetime] = None, require_prices: bool = False,
         "sensitivity": sensitivity,
         "conditional_sensitivity": cond_sens,
         "holiday_impacts": holiday_impacts,
-        "events": _events_records(events),
+        "events": _events_records(report_events, n=120),
         "views": _views_records(views),
         "backtest": bt,
         "model_learning": model_learning,
